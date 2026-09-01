@@ -3,15 +3,33 @@ services:
     name: open-agent
     runtime: docker
     plan: free
+
     healthCheckPath: /health
+
     envVars:
       - key: GEMINI_API_KEY
-        sync: false
+        sync: true
+
+      - key: GITHUB_TOKEN
+        sync: true
+
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
-      - key: MAX_UPLOAD_MB
-        value: "50"
-      - key: MAX_COMMAND_SECONDS
+
+      - key: MAX_AGENT_ITERATIONS
         value: "20"
-      - key: MAX_AGENT_STEPS
-        value: "12"
+
+      - key: MAX_TEST_ITERATIONS
+        value: "5"
+
+      - key: WORKSPACE_TIMEOUT
+        value: "600"
+
+      - key: COMMAND_TIMEOUT
+        value: "180"
+
+      - key: AUTO_PUSH
+        value: "true"
+
+      - key: FRONTEND_ORIGINS
+        value: "*"
