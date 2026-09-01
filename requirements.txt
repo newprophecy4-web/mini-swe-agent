@@ -1,4 +1,6 @@
-mini-swe-agent
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
+requests
+beautifulsoup4
+google-genai
