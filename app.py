@@ -1,45 +1,40 @@
 """
 OPEN AGENT
-Manus-style autonomous software engineering backend.
+Advanced Autonomous AI Software Engineering Backend
 
-Features:
-- ChatGPT-like Chat Mode
-- Plan Mode
-- Finalize Plan
-- Authorized Work Mode
-- GitHub repository clone/read/search/edit
-- Multi-file editing
-- Workspace terminal
-- Project detection
-- Automatic testing
-- Build/typecheck
-- Error -> diagnosis -> fix -> retest loop
-- Git status/diff
-- Branch creation
-- Commit
-- Push
-- ZIP project upload/download
-- Session status/logs
-- Mobile/frontend friendly JSON API
+Architecture:
+    Frontend
+       |
+       v
+    FastAPI
+       |
+       +---- Gemini AI
+       |
+       +---- GitHub
+       |
+       +---- Local Workspace
+       |
+       +---- Git / Test / Build / Typecheck
+       |
+       v
+    Autonomous Work Agent
 
-Environment variables:
-    GEMINI_API_KEY
-    GITHUB_TOKEN
-    GEMINI_MODEL
-    AUTO_PUSH
-    WORKSPACE_ROOT
-    MAX_AGENT_ITERATIONS
-    MAX_TEST_ITERATIONS
-    COMMAND_TIMEOUT
-    MAX_FILE_SIZE
-    MAX_COMMAND_OUTPUT
+Modes:
+    CHAT
+    PLAN
+    WORK
+
+Important:
+    - Work Mode requires explicit authorization.
+    - AI capabilities are based on actual backend capabilities.
+    - Secrets are never returned to frontend.
+    - The agent must never claim an operation succeeded without confirmation.
 """
 
 from __future__ import annotations
 
-import io
+import asyncio
 import json
-import logging
 import os
 import re
 import shutil
@@ -47,1364 +42,644 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 import zipfile
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
-from urllib.parse import urlparse
-
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-
-# ============================================================
-# OPTIONAL GEMINI SDK
-# ============================================================
-
-try:
-    from google import genai
-    from google.genai import types
-except ImportError:
-    genai = None
-    types = None
+from google import genai
+from google.genai import types
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO")
-)
+APP_NAME = "Open Agent"
+APP_VERSION = "2.0.0"
 
-log = logging.getLogger("open-agent")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash",
+).strip()
 
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 
-BASE_DIR = Path(
+WORKSPACE_ROOT = Path(
     os.getenv("WORKSPACE_ROOT", "/tmp/open-agent")
 ).resolve()
 
-BASE_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-2.5-flash"
-)
-
+UPLOAD_ROOT = WORKSPACE_ROOT / "uploads"
+EXPORT_ROOT = WORKSPACE_ROOT / "exports"
 
 MAX_AGENT_ITERATIONS = int(
-    os.getenv("MAX_AGENT_ITERATIONS", "30")
+    os.getenv("MAX_AGENT_ITERATIONS", "20")
 )
-
 
 MAX_TEST_ITERATIONS = int(
-    os.getenv("MAX_TEST_ITERATIONS", "8")
+    os.getenv("MAX_TEST_ITERATIONS", "5")
 )
-
 
 COMMAND_TIMEOUT = int(
     os.getenv("COMMAND_TIMEOUT", "180")
 )
 
+WORKSPACE_TIMEOUT = int(
+    os.getenv("WORKSPACE_TIMEOUT", "600")
+)
 
 MAX_FILE_SIZE = int(
-    os.getenv("MAX_FILE_SIZE", "3000000")
+    os.getenv("MAX_FILE_SIZE", str(2 * 1024 * 1024))
+)
+
+MAX_SEARCH_RESULTS = int(
+    os.getenv("MAX_SEARCH_RESULTS", "100")
+)
+
+AUTO_PUSH = os.getenv(
+    "AUTO_PUSH",
+    "false",
+).lower() == "true"
+
+FRONTEND_ORIGINS = os.getenv(
+    "FRONTEND_ORIGINS",
+    "*",
+)
+
+if FRONTEND_ORIGINS.strip() == "*":
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOWED_ORIGINS = [
+        x.strip()
+        for x in FRONTEND_ORIGINS.split(",")
+        if x.strip()
+    ]
+
+
+WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+    title="Open Agent API",
+    description=(
+        "Advanced autonomous AI software engineering agent "
+        "with Chat, Plan and authorized Work modes."
+    ),
+    version=APP_VERSION,
 )
 
 
-MAX_COMMAND_OUTPUT = int(
-    os.getenv("MAX_COMMAND_OUTPUT", "150000")
-)
-
-
-WORKSPACE_TIMEOUT = int(
-    os.getenv("WORKSPACE_TIMEOUT", "1800")
-)
-
-
-AUTO_PUSH = (
-    os.getenv("AUTO_PUSH", "false").lower()
-    == "true"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
 # ============================================================
-# SECURITY / FILE RULES
+# CAPABILITIES
 # ============================================================
 
-IGNORED_DIRS = {
-    ".git",
-    "node_modules",
-    "dist",
-    "build",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".next",
-    ".cache",
-    "coverage",
+CAPABILITIES: Dict[str, bool] = {
+    "chat": True,
+    "multilingual": True,
+
+    "plan_mode": True,
+    "plan_finalize": True,
+
+    "work_mode": True,
+    "work_authorization": True,
+
+    "github_read": bool(GITHUB_TOKEN),
+    "github_edit": bool(GITHUB_TOKEN),
+
+    "repository_inspect": True,
+    "repository_read": True,
+    "repository_search": True,
+
+    "file_create": True,
+    "file_edit": True,
+    "file_delete": True,
+    "multi_file_edit": True,
+
+    "git_status": True,
+    "git_diff": True,
+
+    "terminal": True,
+    "command_execution": True,
+
+    "auto_testing": True,
+    "auto_build": True,
+    "auto_typecheck": True,
+
+    "error_fix_loop": True,
+
+    "zip_upload": True,
+    "zip_download": True,
+
+    "commit": True,
+    "push": bool(GITHUB_TOKEN),
+
+    "background_work": True,
+    "work_logs": True,
+    "work_stop": True,
 }
 
 
-SENSITIVE_NAMES = {
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".env.development",
-    "credentials",
-    "credentials.json",
-    "id_rsa",
-    "id_ed25519",
-}
+# ============================================================
+# AGENT SYSTEM SPECIFICATION
+# ============================================================
 
+AGENT_SYSTEM_PROMPT = r"""
+You are OPEN AGENT, an advanced autonomous AI software engineering agent.
 
-SENSITIVE_PARTS = (
-    ".pem",
-    ".key",
-    "password",
-    "secret",
-    "credential",
-)
+You are not merely a chatbot.
+
+You operate through a backend that exposes real software-engineering
+capabilities.
+
+============================================================
+CORE PRINCIPLE
+============================================================
+
+Your capabilities are determined by the backend tools and current
+authorized work session.
+
+Never invent a capability.
+
+Never claim that something happened unless the backend actually
+executed it and returned confirmation.
+
+Examples:
+
+WRONG:
+"I pushed the code to GitHub."
+
+if backend did not confirm push.
+
+CORRECT:
+"I could not push the changes because the backend reported..."
+
+============================================================
+MODES
+============================================================
+
+1. CHAT MODE
+------------------------------------------------------------
+
+Chat Mode is normal conversational AI.
+
+You can:
+- explain
+- teach
+- answer questions
+- discuss programming
+- discuss architecture
+- communicate in any language supported by the model
+
+Chat Mode must not modify repository files.
+
+Chat Mode must not commit or push.
+
+------------------------------------------------------------
+
+2. PLAN MODE
+------------------------------------------------------------
+
+Plan Mode is for requirements and planning.
+
+You should:
+- understand the user's goal
+- ask useful questions when necessary
+- identify affected areas
+- propose implementation strategy
+- propose file changes
+- propose testing strategy
+- revise the plan when the user requests changes
+
+Plan Mode must NOT modify files.
+
+Plan Mode must NOT commit.
+
+Plan Mode must NOT push.
+
+The user must explicitly finalize the plan.
+
+------------------------------------------------------------
+
+3. WORK MODE
+------------------------------------------------------------
+
+Work Mode is autonomous software engineering.
+
+Work Mode starts only after explicit user authorization.
+
+Once authorized, you may:
+
+- inspect repository
+- inspect project structure
+- read files
+- search files
+- create files
+- edit files
+- delete files
+- modify multiple files
+- run tests
+- run builds
+- run typechecks
+- inspect git status
+- inspect git diff
+- diagnose errors
+- fix errors
+- retest
+- review changes
+- commit
+- push
+
+Only perform capabilities actually exposed by backend.
+
+============================================================
+AUTONOMOUS WORKFLOW
+============================================================
+
+Follow this sequence whenever practical:
+
+1. Understand task
+2. Inspect repository
+3. Detect project type
+4. Read relevant files
+5. Search relevant code
+6. Determine implementation
+7. Implement changes
+8. Review changed files
+9. Run tests
+10. If failure:
+       diagnose
+       identify root cause
+       fix
+       test again
+11. Run build/typecheck when relevant
+12. Review final diff
+13. Commit only when authorized/required
+14. Push only when authorized/required
+15. Report actual result
+
+Do not stop merely because the first test failed.
+
+Use an error -> fix -> retest loop.
+
+============================================================
+MULTI-FILE ENGINEERING
+============================================================
+
+Real software tasks often require multiple files.
+
+Do not artificially limit yourself to one file.
+
+Examples:
+
+Frontend bug:
+- component
+- API client
+- state management
+- styles
+- tests
+
+Backend bug:
+- route
+- service
+- schema
+- database
+- tests
+
+Configuration:
+- package file
+- source file
+- environment handling
+- documentation
+
+============================================================
+TESTING
+============================================================
+
+Detect project type.
+
+Python:
+- pytest
+- python -m pytest
+
+Node:
+- npm test
+- npm run test
+
+TypeScript:
+- npm run typecheck
+- npx tsc --noEmit
+
+Build:
+- npm run build
+
+Go:
+- go test ./...
+
+Rust:
+- cargo test
+
+Java:
+- Maven/Gradle tests
+
+Only run commands that are appropriate to the detected project.
+
+============================================================
+ERROR HANDLING
+============================================================
+
+When a test/build/typecheck fails:
+
+1. Read the error.
+2. Identify the root cause.
+3. Locate relevant source.
+4. Apply a targeted fix.
+5. Run the failed operation again.
+6. Repeat until:
+   - fixed,
+   - retry limit reached,
+   - or the failure is genuinely external.
+
+Do not hide errors.
+
+Do not claim success when tests failed.
+
+============================================================
+GITHUB
+============================================================
+
+GitHub access is provided by backend.
+
+Never request or expose GITHUB_TOKEN.
+
+Never put GitHub credentials in:
+- source code
+- URLs
+- frontend
+- logs
+- responses
+
+Use the backend's GitHub capability.
+
+============================================================
+FILE OPERATIONS
+============================================================
+
+Always respect the active workspace.
+
+Do not modify files outside the active workspace.
+
+Before destructive changes:
+- inspect target
+- make sure it is relevant
+- preserve unrelated user work
+
+Never blindly delete an entire project.
+
+============================================================
+TERMINAL
+============================================================
+
+Terminal output must represent real commands executed by backend.
+
+Do not fabricate terminal output.
+
+============================================================
+COMMUNICATION
+============================================================
+
+Talk naturally like a highly capable AI engineering assistant.
+
+Do not repeatedly say:
+"I cannot access GitHub"
+
+when the backend provides GitHub access.
+
+Instead determine actual capability and session state.
+
+If an operation is unavailable, explain exactly why.
+
+============================================================
+FINAL REPORT
+============================================================
+
+At completion report:
+
+- what changed
+- files changed
+- tests run
+- test results
+- build/typecheck results
+- errors encountered
+- fixes applied
+- git status
+- commit result if performed
+- push result if performed
+
+Never invent any result.
+"""
 
 
 # ============================================================
-# UTILITIES
+# MODELS
 # ============================================================
 
-def now() -> str:
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1)
 
 
-def redact(value: str) -> str:
-    """
-    Never expose configured secrets in logs/API responses.
-    """
-
-    if not isinstance(value, str):
-        return value
-
-    for secret in (
-        os.getenv("GITHUB_TOKEN"),
-        os.getenv("GEMINI_API_KEY"),
-    ):
-        if secret:
-            value = value.replace(
-                secret,
-                "[REDACTED]"
-            )
-
-    return value
+class PlanRequest(BaseModel):
+    message: str = Field(min_length=1)
+    context: Optional[str] = None
 
 
-def api_error(
-    code: str,
-    message: str,
-    status: int = 400,
-) -> HTTPException:
-
-    return HTTPException(
-        status_code=status,
-        detail={
-            "ok": False,
-            "error": {
-                "code": code,
-                "message": message,
-            },
-        },
-    )
+class FinalizePlanRequest(BaseModel):
+    session_id: str
+    plan: Optional[str] = None
 
 
-def safe_path(
-    root: Path,
-    relative: str,
-    allow_root: bool = False,
-) -> Path:
-
-    if not relative:
-        raise api_error(
-            "INVALID_FILE_PATH",
-            "File path is required.",
-        )
-
-    if "\x00" in relative:
-        raise api_error(
-            "INVALID_FILE_PATH",
-            "Invalid null byte in path.",
-        )
-
-    root = root.resolve()
-
-    candidate = (
-        root / relative
-    ).resolve()
-
-    try:
-        candidate.relative_to(root)
-
-    except ValueError:
-        raise api_error(
-            "INVALID_FILE_PATH",
-            "Path must stay inside workspace.",
-        )
-
-    if (
-        not allow_root
-        and candidate == root
-    ):
-        raise api_error(
-            "INVALID_FILE_PATH",
-            "Repository root cannot be used as a file.",
-        )
-
-    return candidate
+class RepoRequest(BaseModel):
+    repository_url: str
+    branch: Optional[str] = None
 
 
-def is_sensitive(path: str | Path) -> bool:
+class SessionRequest(BaseModel):
+    session_id: str
 
-    parts = [
-        p.lower()
-        for p in Path(path).parts
-    ]
 
-    if not parts:
-        return False
+class ReadFileRequest(BaseModel):
+    session_id: str
+    path: str
 
-    name = parts[-1]
 
-    if name in SENSITIVE_NAMES:
-        return True
+class SearchRequest(BaseModel):
+    session_id: str
+    query: str
 
-    for part in parts:
 
-        if any(
-            marker in part
-            for marker in SENSITIVE_PARTS
-        ):
-            return True
+class EditFileRequest(BaseModel):
+    session_id: str
+    path: str
+    content: str
 
-    return False
+
+class WorkPrepareRequest(BaseModel):
+    session_id: Optional[str] = None
+    repository_url: Optional[str] = None
+    branch: Optional[str] = None
+    authorization: bool = False
+
+
+class WorkExecuteRequest(BaseModel):
+    session_id: str
+    task: Optional[str] = None
+
+
+class CommitRequest(BaseModel):
+    session_id: str
+    message: Optional[str] = None
+
+
+class PushRequest(BaseModel):
+    session_id: str
+    branch: Optional[str] = None
 
 
 # ============================================================
-# PROCESS EXECUTION
-# ============================================================
-
-def run_process(
-    command: list[str],
-    cwd: Path,
-    timeout: int = COMMAND_TIMEOUT,
-) -> dict[str, Any]:
-
-    started = time.monotonic()
-
-    command = [
-        str(x)
-        for x in command
-    ]
-
-    try:
-
-        process = subprocess.run(
-            command,
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=os.environ.copy(),
-        )
-
-        stdout = (
-            process.stdout or ""
-        )[-MAX_COMMAND_OUTPUT:]
-
-        stderr = (
-            process.stderr or ""
-        )[-MAX_COMMAND_OUTPUT:]
-
-        return {
-            "command": command,
-            "stdout": redact(stdout),
-            "stderr": redact(stderr),
-            "exit_code": process.returncode,
-            "duration_ms": int(
-                (time.monotonic() - started)
-                * 1000
-            ),
-            "success": process.returncode == 0,
-        }
-
-    except subprocess.TimeoutExpired:
-
-        return {
-            "command": command,
-            "stdout": "",
-            "stderr": "Command timed out.",
-            "exit_code": -1,
-            "duration_ms": int(
-                (time.monotonic() - started)
-                * 1000
-            ),
-            "success": False,
-            "timed_out": True,
-        }
-
-    except FileNotFoundError:
-
-        return {
-            "command": command,
-            "stdout": "",
-            "stderr": (
-                f"Executable not found: {command[0]}"
-            ),
-            "exit_code": 127,
-            "duration_ms": int(
-                (time.monotonic() - started)
-                * 1000
-            ),
-            "success": False,
-        }
-
-
-# ============================================================
-# TERMINAL
-# ============================================================
-
-def run_terminal(
-    root: Path,
-    command: str,
-    timeout: int | None = None,
-) -> dict[str, Any]:
-
-    command = command.strip()
-
-    if not command:
-        raise ValueError(
-            "Terminal command is empty."
-        )
-
-    timeout = timeout or COMMAND_TIMEOUT
-
-    # The agent receives a real workspace terminal.
-    # Commands are executed with cwd=root.
-    #
-    # Never place secrets in the command.
-    #
-    # The output is redacted before returning.
-
-    result = subprocess.run(
-        command,
-        cwd=str(root),
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=os.environ.copy(),
-    )
-
-    return {
-        "command": command,
-        "stdout": redact(
-            (result.stdout or "")
-            [-MAX_COMMAND_OUTPUT:]
-        ),
-        "stderr": redact(
-            (result.stderr or "")
-            [-MAX_COMMAND_OUTPUT:]
-        ),
-        "exit_code": result.returncode,
-        "success": result.returncode == 0,
-    }
-
-
-# ============================================================
-# GITHUB
-# ============================================================
-
-def parse_github(
-    url: str,
-) -> tuple[str, str]:
-
-    parsed = urlparse(url)
-
-    if parsed.scheme not in {
-        "http",
-        "https",
-    }:
-        raise api_error(
-            "INVALID_GITHUB_URL",
-            "Invalid GitHub URL.",
-        )
-
-    if parsed.netloc.lower() != "github.com":
-        raise api_error(
-            "INVALID_GITHUB_URL",
-            "Only github.com repositories are supported.",
-        )
-
-    parts = [
-        p
-        for p in parsed.path.strip("/").split("/")
-        if p
-    ]
-
-    if len(parts) != 2:
-        raise api_error(
-            "INVALID_GITHUB_URL",
-            "Use https://github.com/owner/repository.git",
-        )
-
-    owner = parts[0]
-
-    repository = parts[1]
-
-    if repository.endswith(".git"):
-        repository = repository[:-4]
-
-    if not re.fullmatch(
-        r"[A-Za-z0-9_.-]+",
-        owner,
-    ):
-        raise api_error(
-            "INVALID_GITHUB_URL",
-            "Invalid repository owner.",
-        )
-
-    if not re.fullmatch(
-        r"[A-Za-z0-9_.-]+",
-        repository,
-    ):
-        raise api_error(
-            "INVALID_GITHUB_URL",
-            "Invalid repository name.",
-        )
-
-    return owner, repository
-
-
-def github_env() -> dict[str, str]:
-
-    env = os.environ.copy()
-
-    token = env.get(
-        "GITHUB_TOKEN"
-    )
-
-    if token:
-
-        env["GIT_CONFIG_COUNT"] = "1"
-
-        env["GIT_CONFIG_KEY_0"] = (
-            "http.https://github.com/.extraheader"
-        )
-
-        env["GIT_CONFIG_VALUE_0"] = (
-            f"AUTHORIZATION: bearer {token}"
-        )
-
-    return env
-
-
-def clone_repo(
-    repo_url: str,
-    destination: Path,
-) -> dict[str, Any]:
-
-    owner, name = parse_github(
-        repo_url
-    )
-
-    token = os.getenv(
-        "GITHUB_TOKEN"
-    )
-
-    if not token:
-        raise api_error(
-            "GITHUB_TOKEN_MISSING",
-            "GITHUB_TOKEN is not configured.",
-            503,
-        )
-
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    result = subprocess.run(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            repo_url,
-            str(destination),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=COMMAND_TIMEOUT,
-        env=github_env(),
-    )
-
-    if result.returncode != 0:
-
-        message = redact(
-            result.stderr or
-            result.stdout or
-            "Git clone failed."
-        )
-
-        raise api_error(
-            "GITHUB_CLONE_FAILED",
-            message[-3000:],
-            400,
-        )
-
-    branch = run_process(
-        [
-            "git",
-            "branch",
-            "--show-current",
-        ],
-        destination,
-    )
-
-    commit = run_process(
-        [
-            "git",
-            "rev-parse",
-            "HEAD",
-        ],
-        destination,
-    )
-
-    return {
-        "owner": owner,
-        "name": name,
-        "url": repo_url,
-        "branch": (
-            branch["stdout"].strip()
-            or "HEAD"
-        ),
-        "commit": (
-            commit["stdout"].strip()
-        ),
-    }
-
-
-# ============================================================
-# FILE SYSTEM
-# ============================================================
-
-def list_tree(
-    root: Path,
-    limit: int = 3000,
-) -> list[str]:
-
-    if not root.exists():
-        return []
-
-    result = []
-
-    for path in sorted(
-        root.rglob("*")
-    ):
-
-        relative = path.relative_to(
-            root
-        )
-
-        if any(
-            part in IGNORED_DIRS
-            for part in relative.parts
-        ):
-            continue
-
-        result.append(
-            str(relative)
-        )
-
-        if len(result) >= limit:
-            break
-
-    return result
-
-
-def read_file(
-    root: Path,
-    relative: str,
-) -> str:
-
-    path = safe_path(
-        root,
-        relative,
-    )
-
-    if is_sensitive(path):
-        raise ValueError(
-            "Sensitive files cannot be read."
-        )
-
-    if not path.is_file():
-        raise ValueError(
-            "File not found."
-        )
-
-    if path.stat().st_size > MAX_FILE_SIZE:
-        raise ValueError(
-            "File is too large."
-        )
-
-    return path.read_text(
-        errors="replace"
-    )
-
-
-def write_file(
-    root: Path,
-    relative: str,
-    content: str,
-) -> dict[str, Any]:
-
-    if not isinstance(
-        content,
-        str,
-    ):
-        raise ValueError(
-            "File content must be text."
-        )
-
-    if len(
-        content.encode("utf-8")
-    ) > MAX_FILE_SIZE:
-
-        raise ValueError(
-            "File exceeds size limit."
-        )
-
-    path = safe_path(
-        root,
-        relative,
-    )
-
-    if path.name == ".git":
-        raise ValueError(
-            "Protected path."
-        )
-
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    fd, temporary = tempfile.mkstemp(
-        prefix=".open-agent-",
-        dir=str(path.parent),
-    )
-
-    os.close(fd)
-
-    try:
-
-        Path(temporary).write_text(
-            content,
-            encoding="utf-8",
-        )
-
-        os.replace(
-            temporary,
-            path,
-        )
-
-    finally:
-
-        if os.path.exists(
-            temporary
-        ):
-            os.unlink(
-                temporary
-            )
-
-    return {
-        "path": relative,
-        "bytes": len(
-            content.encode("utf-8")
-        ),
-    }
-
-
-def delete_file(
-    root: Path,
-    relative: str,
-) -> dict[str, Any]:
-
-    path = safe_path(
-        root,
-        relative,
-    )
-
-    if is_sensitive(path):
-        raise ValueError(
-            "Sensitive files cannot be deleted."
-        )
-
-    if not path.is_file():
-        raise ValueError(
-            "File not found."
-        )
-
-    path.unlink()
-
-    return {
-        "deleted": relative
-    }
-
-
-def search_files(
-    root: Path,
-    query: str,
-) -> list[dict[str, Any]]:
-
-    matches = []
-
-    for relative in list_tree(
-        root
-    ):
-
-        path = safe_path(
-            root,
-            relative,
-        )
-
-        if (
-            not path.is_file()
-            or is_sensitive(path)
-        ):
-            continue
-
-        if (
-            path.stat().st_size
-            > MAX_FILE_SIZE
-        ):
-            continue
-
-        try:
-
-            lines = path.read_text(
-                errors="replace"
-            ).splitlines()
-
-        except OSError:
-            continue
-
-        for number, line in enumerate(
-            lines,
-            1,
-        ):
-
-            if query.lower() in line.lower():
-
-                matches.append(
-                    {
-                        "path": relative,
-                        "line": number,
-                        "text": line[:1000],
-                    }
-                )
-
-                if len(matches) >= 500:
-                    return matches
-
-    return matches
-
-
-# ============================================================
-# PROJECT DETECTION
-# ============================================================
-
-def detect_project(
-    root: Path,
-) -> dict[str, Any]:
-
-    names = {
-        p.name
-        for p in root.iterdir()
-    }
-
-    project_type = "unknown"
-    framework = None
-    package_manager = None
-
-    tests: list[list[str]] = []
-    builds: list[list[str]] = []
-    typechecks: list[list[str]] = []
-
-    # Python
-    if (
-        "pyproject.toml" in names
-        or "requirements.txt" in names
-        or "setup.py" in names
-    ):
-
-        project_type = "python"
-        package_manager = "pip"
-
-        if (
-            (root / "pytest.ini").exists()
-            or (root / "tests").exists()
-            or "pytest" in (
-                root.joinpath(
-                    "requirements.txt"
-                ).read_text(
-                    errors="ignore"
-                )
-                if (
-                    root / "requirements.txt"
-                ).exists()
-                else ""
-            )
-        ):
-            tests = [
-                ["python", "-m", "pytest"]
-            ]
-
-        else:
-
-            tests = [
-                ["python", "-m", "pytest"]
-            ]
-
-    # Node
-    elif "package.json" in names:
-
-        project_type = "node"
-        package_manager = "npm"
-
-        try:
-
-            package = json.loads(
-                (
-                    root / "package.json"
-                ).read_text(
-                    errors="replace"
-                )
-            )
-
-            scripts = package.get(
-                "scripts",
-                {}
-            )
-
-            dependencies = {
-                **package.get(
-                    "dependencies",
-                    {}
-                ),
-                **package.get(
-                    "devDependencies",
-                    {}
-                ),
-            }
-
-            if "next" in dependencies:
-                framework = "Next.js"
-
-            elif "vite" in dependencies:
-                framework = "Vite"
-
-            elif "react" in dependencies:
-                framework = "React"
-
-            elif "vue" in dependencies:
-                framework = "Vue"
-
-            elif "angular" in dependencies:
-                framework = "Angular"
-
-            else:
-                framework = "Node.js"
-
-            if "test" in scripts:
-                tests.append(
-                    ["npm", "test"]
-                )
-
-            if "build" in scripts:
-                builds.append(
-                    ["npm", "run", "build"]
-                )
-
-            if "typecheck" in scripts:
-                typechecks.append(
-                    [
-                        "npm",
-                        "run",
-                        "typecheck",
-                    ]
-                )
-
-            elif "typescript" in dependencies:
-                typechecks.append(
-                    [
-                        "npx",
-                        "tsc",
-                        "--noEmit",
-                    ]
-                )
-
-        except Exception:
-            pass
-
-    # Go
-    elif "go.mod" in names:
-
-        project_type = "go"
-        package_manager = "go"
-
-        tests = [
-            ["go", "test", "./..."]
-        ]
-
-    # Rust
-    elif "Cargo.toml" in names:
-
-        project_type = "rust"
-        package_manager = "cargo"
-
-        tests = [
-            ["cargo", "test"]
-        ]
-
-    # Java
-    elif "pom.xml" in names:
-
-        project_type = "java"
-        package_manager = "maven"
-
-        tests = [
-            ["mvn", "test"]
-        ]
-
-    elif (
-        "build.gradle" in names
-        or "build.gradle.kts" in names
-    ):
-
-        project_type = "java"
-        package_manager = "gradle"
-
-        tests = [
-            ["./gradlew", "test"]
-        ]
-
-    return {
-        "project_type": project_type,
-        "framework": framework,
-        "package_manager": package_manager,
-        "test_commands": tests,
-        "build_commands": builds,
-        "typecheck_commands": typechecks,
-        "files": list_tree(root),
-    }
-
-
-# ============================================================
-# GIT
-# ============================================================
-
-def git_status(
-    root: Path,
-) -> dict[str, Any]:
-
-    return run_process(
-        [
-            "git",
-            "status",
-            "--short",
-        ],
-        root,
-    )
-
-
-def git_diff(
-    root: Path,
-) -> dict[str, Any]:
-
-    status = git_status(
-        root
-    )
-
-    diff = run_process(
-        [
-            "git",
-            "diff",
-        ],
-        root,
-    )
-
-    stat = run_process(
-        [
-            "git",
-            "diff",
-            "--stat",
-        ],
-        root,
-    )
-
-    return {
-        "status": status,
-        "stat": stat["stdout"],
-        "diff": diff["stdout"][
-            -MAX_COMMAND_OUTPUT:
-        ],
-    }
-
-
-def git_create_branch(
-    root: Path,
-    branch: str,
-) -> dict[str, Any]:
-
-    if not re.fullmatch(
-        r"[A-Za-z0-9._/-]+",
-        branch,
-    ):
-        raise ValueError(
-            "Invalid branch name."
-        )
-
-    return run_process(
-        [
-            "git",
-            "checkout",
-            "-b",
-            branch,
-        ],
-        root,
-    )
-
-
-def git_commit(
-    root: Path,
-    message: str,
-) -> dict[str, Any]:
-
-    if len(message.strip()) < 5:
-        raise ValueError(
-            "Commit message is too short."
-        )
-
-    add = run_process(
-        [
-            "git",
-            "add",
-            "-A",
-        ],
-        root,
-    )
-
-    if not add["success"]:
-        return {
-            "add": add,
-            "success": False,
-        }
-
-    commit = run_process(
-        [
-            "git",
-            "commit",
-            "-m",
-            message,
-        ],
-        root,
-    )
-
-    sha = None
-
-    if commit["success"]:
-
-        sha_result = run_process(
-            [
-                "git",
-                "rev-parse",
-                "HEAD",
-            ],
-            root,
-        )
-
-        sha = sha_result[
-            "stdout"
-        ].strip()
-
-    return {
-        "add": add,
-        "commit": commit,
-        "sha": sha,
-        "success": commit["success"],
-    }
-
-
-def git_push(
-    root: Path,
-    branch: str,
-) -> dict[str, Any]:
-
-    if not os.getenv(
-        "GITHUB_TOKEN"
-    ):
-        raise ValueError(
-            "GITHUB_TOKEN is not configured."
-        )
-
-    result = subprocess.run(
-        [
-            "git",
-            "push",
-            "origin",
-            branch,
-        ],
-        cwd=str(root),
-        capture_output=True,
-        text=True,
-        timeout=COMMAND_TIMEOUT,
-        env=github_env(),
-    )
-
-    return {
-        "success": result.returncode == 0,
-        "branch": branch,
-        "stdout": redact(
-            result.stdout[-5000:]
-        ),
-        "stderr": redact(
-            result.stderr[-5000:]
-        ),
-        "exit_code": result.returncode,
-    }
-
-
-# ============================================================
-# DIFF SUMMARY
-# ============================================================
-
-def diff_summary(
-    root: Path,
-) -> dict[str, Any]:
-
-    status = run_process(
-        [
-            "git",
-            "status",
-            "--short",
-        ],
-        root,
-    )
-
-    modified = []
-    added = []
-    deleted = []
-    renamed = []
-
-    for line in (
-        status["stdout"]
-        .splitlines()
-    ):
-
-        if len(line) < 3:
-            continue
-
-        code = line[:2]
-        path = line[3:]
-
-        if "?" in code or "A" in code:
-            added.append(path)
-
-        elif "D" in code:
-            deleted.append(path)
-
-        elif "R" in code:
-            renamed.append(path)
-
-        else:
-            modified.append(path)
-
-    return {
-        "added": added,
-        "modified": modified,
-        "deleted": deleted,
-        "renamed": renamed,
-        "total_changed": (
-            len(added)
-            + len(modified)
-            + len(deleted)
-            + len(renamed)
-        ),
-    }
-
-
-# ============================================================
-# SESSIONS
+# SESSION
 # ============================================================
 
 @dataclass
-class Session:
-
+class AgentSession:
     id: str
 
-    mode: str
+    mode: str = "chat"
 
-    workspace: Path
+    workspace: Optional[Path] = None
 
-    repository: dict[str, Any] = field(
-        default_factory=dict
-    )
+    repository: Optional[Dict[str, Any]] = None
+    project: Optional[Dict[str, Any]] = None
 
-    project: dict[str, Any] = field(
-        default_factory=dict
-    )
+    plan: Optional[str] = None
+    plan_finalized: bool = False
 
-    approved_plan: Any = field(
-        default_factory=dict
-    )
+    authorized: bool = False
 
-    task: str = ""
+    task: Optional[str] = None
 
     status: str = "created"
 
     cancelled: bool = False
 
-    logs: list[dict[str, Any]] = field(
+    iterations: int = 0
+    test_iterations: int = 0
+
+    logs: List[Dict[str, Any]] = field(
         default_factory=list
     )
 
-    iterations: list[dict[str, Any]] = field(
-        default_factory=list
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+
+    lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
     )
 
-    lock: threading.Lock = field(
-        default_factory=threading.Lock
+
+SESSIONS: Dict[str, AgentSession] = {}
+
+SESSIONS_LOCK = threading.RLock()
+
+
+def create_session(
+    mode: str = "chat",
+) -> AgentSession:
+
+    session = AgentSession(
+        id=str(uuid.uuid4()),
+        mode=mode,
     )
 
-    def log(
-        self,
-        level: str,
-        event: str,
-        message: str,
-        **extra: Any,
-    ):
+    with SESSIONS_LOCK:
+        SESSIONS[session.id] = session
 
-        item = {
-            "timestamp": now(),
-            "level": level,
-            "event": event,
-            "message": redact(message),
-            **extra,
-        }
-
-        with self.lock:
-            self.logs.append(item)
-
-        getattr(
-            log,
-            level
-            if level in {
-                "debug",
-                "info",
-                "warning",
-                "error",
-            }
-            else "info",
-        )(
-            redact(message)
-        )
-
-
-SESSIONS: dict[
-    str,
-    Session
-] = {}
-
-
-def validate_session_id(
-    session_id: str,
-):
-
-    if not re.fullmatch(
-        r"[A-Za-z0-9_-]{3,80}",
-        session_id,
-    ):
-        raise api_error(
-            "INVALID_SESSION_ID",
-            "Invalid session ID.",
-        )
-
-
-def new_workspace(
-    session_id: str,
-) -> Path:
-
-    validate_session_id(
-        session_id
-    )
-
-    path = (
-        BASE_DIR / session_id
-    ).resolve()
-
-    try:
-
-        path.relative_to(
-            BASE_DIR
-        )
-
-    except ValueError:
-
-        raise api_error(
-            "WORKSPACE_ERROR",
-            "Invalid workspace.",
-        )
-
-    if path.exists():
-        shutil.rmtree(
-            path,
-            ignore_errors=True
-        )
-
-    path.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    return path
+    return session
 
 
 def get_session(
     session_id: str,
-) -> Session:
+) -> AgentSession:
 
-    session = SESSIONS.get(
-        session_id
-    )
+    with SESSIONS_LOCK:
+        session = SESSIONS.get(session_id)
 
     if not session:
-        raise api_error(
-            "SESSION_NOT_FOUND",
-            "Work session not found.",
-            404,
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
         )
 
     return session
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def log_event(
+    session: AgentSession,
+    event: str,
+    message: str,
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+
+    entry = {
+        "timestamp": time.time(),
+        "event": event,
+        "message": message,
+    }
+
+    if data:
+        entry["data"] = data
+
+    with session.lock:
+        session.logs.append(entry)
+
+        # Keep memory bounded.
+        if len(session.logs) > 1000:
+            del session.logs[:-1000]
 
 
 # ============================================================
@@ -1413,974 +688,1928 @@ def get_session(
 
 class GeminiService:
 
-    def __init__(self):
+    def __init__(self) -> None:
 
-        self.client = None
+        self.client: Optional[genai.Client] = None
 
-        key = os.getenv(
-            "GEMINI_API_KEY"
-        )
-
-        if (
-            genai
-            and key
-        ):
-
-            self.client = (
-                genai.Client(
-                    api_key=key
-                )
+        if GEMINI_API_KEY:
+            self.client = genai.Client(
+                api_key=GEMINI_API_KEY
             )
 
-    def text(
+    def available(self) -> bool:
+        return self.client is not None
+
+    async def text(
         self,
         prompt: str,
-        json_mode: bool = False,
-    ) -> Any:
+        system: Optional[str] = None,
+        temperature: float = 0.2,
+    ) -> str:
 
         if not self.client:
-
-            raise api_error(
-                "AI_NOT_CONFIGURED",
-                "Gemini API is not configured.",
-                503,
+            raise HTTPException(
+                status_code=503,
+                detail="GEMINI_API_KEY is not configured.",
             )
 
-        last_error = None
+        full_prompt = prompt
 
-        for attempt in range(5):
+        if system:
+            full_prompt = (
+                system
+                + "\n\n"
+                + prompt
+            )
+
+        last_error: Optional[Exception] = None
+
+        for attempt in range(4):
 
             try:
 
-                config = None
-
-                if (
-                    json_mode
-                    and types
-                ):
-
-                    config = (
-                        types.GenerateContentConfig(
-                            response_mime_type=(
-                                "application/json"
-                            )
-                        )
-                    )
-
-                response = (
-                    self.client.models.generate_content(
+                def call_model():
+                    return self.client.models.generate_content(
                         model=GEMINI_MODEL,
-                        contents=prompt,
-                        config=config,
+                        contents=full_prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=temperature,
+                        ),
                     )
+
+                response = await asyncio.to_thread(
+                    call_model
                 )
 
-                text = (
-                    response.text
-                    or ""
-                ).strip()
+                text = getattr(
+                    response,
+                    "text",
+                    None,
+                )
 
-                if json_mode:
+                if text:
+                    return text.strip()
 
-                    # Handle occasional markdown fences.
-                    text = re.sub(
-                        r"^```(?:json)?\s*",
-                        "",
-                        text,
-                        flags=re.I,
-                    )
-
-                    text = re.sub(
-                        r"\s*```$",
-                        "",
-                        text,
-                    )
-
-                    return json.loads(
-                        text
-                    )
-
-                return text
+                return ""
 
             except Exception as exc:
 
                 last_error = exc
 
-                marker = str(
-                    exc
-                ).lower()
-
-                retryable = any(
-                    token in marker
-                    for token in (
-                        "429",
-                        "503",
-                        "unavailable",
-                        "resource exhausted",
-                        "temporarily",
-                        "deadline",
-                        "timeout",
+                # Temporary Gemini/service failures.
+                if attempt < 3:
+                    await asyncio.sleep(
+                        1.5 * (attempt + 1)
                     )
-                )
 
-                if (
-                    not retryable
-                    or attempt == 4
-                ):
-                    break
-
-                delay = min(
-                    2 ** attempt,
-                    16,
-                )
-
-                time.sleep(
-                    delay
-                )
-
-        log.error(
-            "Gemini error: %s",
-            redact(
-                str(last_error)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "AI service is temporarily unavailable. "
+                f"Reason: {last_error}"
             ),
         )
 
-        raise api_error(
-            "AI_REQUEST_FAILED",
-            "The AI provider could not complete the request. Please retry.",
-            503,
+
+gemini_service = GeminiService()
+
+
+# ============================================================
+# JSON EXTRACTION
+# ============================================================
+
+def extract_json(
+    text: str,
+) -> Optional[Any]:
+
+    text = text.strip()
+
+    # Direct JSON
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Markdown code block
+    match = re.search(
+        r"```(?:json)?\s*(.*?)\s*```",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    if match:
+        try:
+            return json.loads(
+                match.group(1)
+            )
+        except Exception:
+            pass
+
+    # First object
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start >= 0 and end > start:
+
+        try:
+            return json.loads(
+                text[start:end + 1]
+            )
+        except Exception:
+            pass
+
+    return None
+
+
+# ============================================================
+# SAFE PATH HANDLING
+# ============================================================
+
+def safe_path(
+    session: AgentSession,
+    relative_path: str,
+) -> Path:
+
+    if not session.workspace:
+        raise HTTPException(
+            status_code=400,
+            detail="Session has no workspace.",
         )
 
+    relative_path = (
+        relative_path
+        .replace("\\", "/")
+        .strip()
+    )
 
-GEMINI = GeminiService()
+    if not relative_path:
+        raise HTTPException(
+            status_code=400,
+            detail="File path is required.",
+        )
+
+    candidate = (
+        session.workspace
+        / relative_path
+    ).resolve()
+
+    try:
+        candidate.relative_to(
+            session.workspace.resolve()
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Path escapes workspace.",
+        )
+
+    return candidate
 
 
 # ============================================================
-# AI PROMPTS
+# SECRET-SAFE ENVIRONMENT
 # ============================================================
 
-def context_text(
-    value: Any,
-) -> str:
+def safe_environment() -> Dict[str, str]:
 
-    if value is None:
-        return ""
+    env = dict(os.environ)
 
-    if isinstance(
-        value,
-        str,
-    ):
-        return value
+    secret_names = {
+        "GITHUB_TOKEN",
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GH_TOKEN",
+    }
+
+    for key in secret_names:
+        env.pop(key, None)
+
+    return env
+
+
+# ============================================================
+# COMMAND EXECUTION
+# ============================================================
+
+def run_process(
+    command: List[str],
+    cwd: Path,
+    timeout: int = COMMAND_TIMEOUT,
+) -> Dict[str, Any]:
+
+    if not cwd.exists():
+        raise RuntimeError(
+            f"Working directory does not exist: {cwd}"
+        )
+
+    start = time.time()
 
     try:
 
-        return json.dumps(
-            value,
-            ensure_ascii=False,
+        process = subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=safe_environment(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            shell=False,
         )
 
+        return {
+            "command": command,
+            "returncode": process.returncode,
+            "stdout": process.stdout[-30000:],
+            "stderr": process.stderr[-30000:],
+            "duration": round(
+                time.time() - start,
+                2,
+            ),
+            "ok": process.returncode == 0,
+        }
+
+    except subprocess.TimeoutExpired as exc:
+
+        return {
+            "command": command,
+            "returncode": -1,
+            "stdout": (
+                exc.stdout[-30000:]
+                if isinstance(exc.stdout, str)
+                else ""
+            ),
+            "stderr": (
+                exc.stderr[-30000:]
+                if isinstance(exc.stderr, str)
+                else ""
+            ),
+            "duration": round(
+                time.time() - start,
+                2,
+            ),
+            "ok": False,
+            "timeout": True,
+        }
+
+
+# ============================================================
+# GITHUB
+# ============================================================
+
+GITHUB_URL_RE = re.compile(
+    r"^https?://github\.com/"
+    r"([^/\s]+)/([^/\s]+?)"
+    r"(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+
+def parse_github(
+    url: str,
+) -> Tuple[str, str]:
+
+    url = url.strip()
+
+    match = GITHUB_URL_RE.match(url)
+
+    if not match:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid GitHub repository URL.",
+        )
+
+    owner = match.group(1)
+    repo = match.group(2)
+
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+
+    return owner, repo
+
+
+def github_auth_header() -> str:
+
+    if not GITHUB_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="GITHUB_TOKEN is not configured.",
+        )
+
+    return (
+        "http.extraheader="
+        f"AUTHORIZATION: bearer {GITHUB_TOKEN}"
+    )
+
+
+def clone_repo(
+    repository_url: str,
+    branch: Optional[str],
+    destination: Path,
+) -> Dict[str, Any]:
+
+    if not GITHUB_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "GitHub access is not configured. "
+                "Set GITHUB_TOKEN on the backend."
+            ),
+        )
+
+    parse_github(repository_url)
+
+    if destination.exists():
+        shutil.rmtree(destination)
+
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    command = [
+        "git",
+        "-c",
+        github_auth_header(),
+        "clone",
+    ]
+
+    if branch:
+        command += [
+            "--branch",
+            branch,
+        ]
+
+    command += [
+        repository_url,
+        str(destination),
+    ]
+
+    result = run_process(
+        command,
+        WORKSPACE_ROOT,
+        timeout=WORKSPACE_TIMEOUT,
+    )
+
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "GitHub clone failed.",
+                "stderr": result["stderr"],
+            },
+        )
+
+    # Ensure git doesn't accidentally persist auth config.
+    try:
+        run_process(
+            [
+                "git",
+                "config",
+                "--local",
+                "--unset-all",
+                "http.extraheader",
+            ],
+            destination,
+            timeout=30,
+        )
     except Exception:
+        pass
 
-        return str(value)
-
-
-CHAT_SYSTEM = """
-You are Open Agent.
-
-You behave like a highly capable ChatGPT-style assistant.
-
-You can:
-- discuss ideas
-- explain programming
-- analyze architecture
-- debug concepts
-- help with software engineering
-- communicate naturally in the user's language
-- support multilingual conversation
-
-You are NOT executing repository operations in Chat Mode.
-
-Never falsely claim to have changed a file, committed code,
-pushed code, or inspected a repository.
-
-If the user wants repository execution, explain that Work Mode
-must be authorized and prepared first.
-"""
-
-
-PLAN_SYSTEM = """
-You are Open Agent Plan Mode.
-
-You are a senior software architect.
-
-Analyze the user's goal carefully.
-
-Do not modify files.
-
-Create an implementation plan containing:
-- goal
-- requirements
-- architecture
-- affected files
-- new files
-- dependencies
-- implementation steps
-- tests
-- build/typecheck requirements
-- risks
-- assumptions
-- questions if truly necessary
-
-If repository information is available, reason from it.
-Do not invent repository facts.
-"""
-
-
-AGENT_SYSTEM = """
-You are Open Agent Work Mode.
-
-You are an autonomous senior software engineering agent.
-
-You have access to a prepared authorized workspace.
-
-Your workflow is:
-
-1. Understand the approved task.
-2. Inspect the repository.
-3. Read relevant files.
-4. Search when necessary.
-5. Understand architecture.
-6. Make minimal correct changes.
-7. Handle multiple files when necessary.
-8. Run tests.
-9. Run build/typecheck when appropriate.
-10. Inspect failures.
-11. Diagnose the ROOT CAUSE.
-12. Fix the problem.
-13. Re-run validation.
-14. Repeat error -> diagnosis -> fix -> test.
-15. Review git diff.
-16. Commit when authorized.
-17. Push when authorized.
-18. Finish with an accurate report.
-
-Never pretend an operation succeeded.
-
-You MUST use tools/actions when needed.
-
-Do not stop just because the first test fails.
-Do not make random fixes.
-
-Allowed actions:
-
-list_files
-read_file
-search_files
-write_file
-delete_file
-terminal
-run_test
-run_build
-run_typecheck
-git_status
-git_diff
-git_branch
-git_commit
-git_push
-finish
-
-Return ONLY JSON.
-
-JSON format:
-
-{
-  "action": "action_name",
-  "path": "...",
-  "query": "...",
-  "content": "...",
-  "command": "...",
-  "message": "...",
-  "reason": "..."
-}
-
-Only fields needed for the action are required.
-
-For write_file, provide COMPLETE file content.
-
-Before editing unfamiliar code, inspect it first.
-
-Use terminal for project-specific commands.
-
-Do not expose secrets.
-
-Do not modify .git internals.
-"""
+    return result
 
 
 # ============================================================
-# ACTION VALIDATION
+# GIT
 # ============================================================
 
-ALLOWED_ACTIONS = {
-    "list_files",
-    "read_file",
-    "search_files",
-    "write_file",
-    "delete_file",
-    "terminal",
-    "run_test",
-    "run_build",
-    "run_typecheck",
-    "git_status",
-    "git_diff",
-    "git_branch",
-    "git_commit",
-    "git_push",
-    "finish",
+def git_status(
+    workspace: Path,
+) -> Dict[str, Any]:
+
+    result = run_process(
+        [
+            "git",
+            "status",
+            "--short",
+            "--branch",
+        ],
+        workspace,
+    )
+
+    return result
+
+
+def git_diff(
+    workspace: Path,
+) -> Dict[str, Any]:
+
+    result = run_process(
+        [
+            "git",
+            "diff",
+            "--",
+        ],
+        workspace,
+    )
+
+    return result
+
+
+def git_commit(
+    workspace: Path,
+    message: str,
+) -> Dict[str, Any]:
+
+    run_process(
+        [
+            "git",
+            "config",
+            "user.name",
+            "Open Agent",
+        ],
+        workspace,
+    )
+
+    run_process(
+        [
+            "git",
+            "config",
+            "user.email",
+            "open-agent@localhost",
+        ],
+        workspace,
+    )
+
+    add_result = run_process(
+        [
+            "git",
+            "add",
+            "-A",
+        ],
+        workspace,
+    )
+
+    if not add_result["ok"]:
+        return add_result
+
+    return run_process(
+        [
+            "git",
+            "commit",
+            "-m",
+            message,
+        ],
+        workspace,
+    )
+
+
+def git_push(
+    workspace: Path,
+    branch: Optional[str] = None,
+) -> Dict[str, Any]:
+
+    if not GITHUB_TOKEN:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stderr": (
+                "GITHUB_TOKEN is not configured."
+            ),
+        }
+
+    current_branch = run_process(
+        [
+            "git",
+            "branch",
+            "--show-current",
+        ],
+        workspace,
+    )
+
+    current = (
+        current_branch["stdout"].strip()
+        if current_branch["ok"]
+        else ""
+    )
+
+    target = branch or current
+
+    if not target:
+        target = "main"
+
+    return run_process(
+        [
+            "git",
+            "-c",
+            github_auth_header(),
+            "push",
+            "origin",
+            target,
+        ],
+        workspace,
+        timeout=WORKSPACE_TIMEOUT,
+    )
+
+
+# ============================================================
+# FILE TREE
+# ============================================================
+
+IGNORED_DIRECTORIES = {
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    "coverage",
 }
 
 
-def validate_action(
-    action: dict[str, Any],
+def list_tree(
+    workspace: Path,
+    max_items: int = 2000,
+) -> List[Dict[str, Any]]:
+
+    items: List[Dict[str, Any]] = []
+
+    for path in workspace.rglob("*"):
+
+        if any(
+            part in IGNORED_DIRECTORIES
+            for part in path.parts
+        ):
+            continue
+
+        try:
+            relative = path.relative_to(
+                workspace
+            )
+        except ValueError:
+            continue
+
+        if len(items) >= max_items:
+            break
+
+        items.append(
+            {
+                "path": str(relative).replace(
+                    "\\",
+                    "/",
+                ),
+                "type": (
+                    "directory"
+                    if path.is_dir()
+                    else "file"
+                ),
+            }
+        )
+
+    return sorted(
+        items,
+        key=lambda x: x["path"],
+    )
+
+
+# ============================================================
+# PROJECT DETECTION
+# ============================================================
+
+def detect_project(
+    workspace: Path,
+) -> Dict[str, Any]:
+
+    files = {
+        p.name.lower()
+        for p in workspace.iterdir()
+    }
+
+    project_type = "unknown"
+
+    if (
+        "package.json" in files
+        or "package-lock.json" in files
+    ):
+        project_type = "node"
+
+    elif (
+        "pyproject.toml" in files
+        or "requirements.txt" in files
+        or "setup.py" in files
+    ):
+        project_type = "python"
+
+    elif (
+        "go.mod" in files
+    ):
+        project_type = "go"
+
+    elif (
+        "cargo.toml" in files
+    ):
+        project_type = "rust"
+
+    elif (
+        "pom.xml" in files
+    ):
+        project_type = "java-maven"
+
+    elif (
+        "build.gradle" in files
+        or "build.gradle.kts" in files
+    ):
+        project_type = "java-gradle"
+
+    return {
+        "type": project_type,
+        "root": str(workspace),
+        "files": sorted(files),
+    }
+
+
+# ============================================================
+# FILE READING
+# ============================================================
+
+def read_file(
+    path: Path,
 ) -> str:
 
-    if not isinstance(
-        action,
-        dict,
-    ):
-        raise ValueError(
-            "AI returned an invalid action."
+    if not path.exists():
+        raise FileNotFoundError(
+            str(path)
         )
 
-    name = action.get(
-        "action"
+    if not path.is_file():
+        raise IsADirectoryError(
+            str(path)
+        )
+
+    size = path.stat().st_size
+
+    if size > MAX_FILE_SIZE:
+        raise ValueError(
+            f"File exceeds MAX_FILE_SIZE: {size}"
+        )
+
+    return path.read_text(
+        encoding="utf-8",
+        errors="replace",
     )
-
-    if name not in ALLOWED_ACTIONS:
-
-        raise ValueError(
-            f"Unsupported action: {name}"
-        )
-
-    return name
 
 
 # ============================================================
-# ACTION EXECUTION
+# SEARCH
 # ============================================================
 
-def execute_action(
-    session: Session,
-    action: dict[str, Any],
-) -> dict[str, Any]:
+def search_files(
+    workspace: Path,
+    query: str,
+) -> List[Dict[str, Any]]:
 
-    root = (
-        session.workspace
-        / "repo"
+    results: List[Dict[str, Any]] = []
+
+    query_lower = query.lower()
+
+    for path in workspace.rglob("*"):
+
+        if len(results) >= MAX_SEARCH_RESULTS:
+            break
+
+        if not path.is_file():
+            continue
+
+        if any(
+            part in IGNORED_DIRECTORIES
+            for part in path.parts
+        ):
+            continue
+
+        try:
+            if path.stat().st_size > MAX_FILE_SIZE:
+                continue
+
+            content = path.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
+
+        except Exception:
+            continue
+
+        lines = content.splitlines()
+
+        for index, line in enumerate(lines, 1):
+
+            if query_lower in line.lower():
+
+                results.append(
+                    {
+                        "path": str(
+                            path.relative_to(
+                                workspace
+                            )
+                        ).replace(
+                            "\\",
+                            "/",
+                        ),
+                        "line": index,
+                        "text": line[:1000],
+                    }
+                )
+
+                if len(results) >= MAX_SEARCH_RESULTS:
+                    break
+
+    return results
+
+
+# ============================================================
+# PROJECT TEST STRATEGY
+# ============================================================
+
+def test_commands(
+    project: Dict[str, Any],
+    workspace: Path,
+) -> List[List[str]]:
+
+    ptype = project.get(
+        "type",
+        "unknown",
     )
 
-    name = validate_action(
-        action
+    commands: List[List[str]] = []
+
+    if ptype == "python":
+
+        if (workspace / "pytest.ini").exists() \
+                or (workspace / "pyproject.toml").exists() \
+                or (workspace / "tests").exists():
+
+            commands.append(
+                [
+                    "python",
+                    "-m",
+                    "pytest",
+                ]
+            )
+
+    elif ptype == "node":
+
+        package_json = workspace / "package.json"
+
+        if package_json.exists():
+
+            try:
+                package = json.loads(
+                    package_json.read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+                scripts = package.get(
+                    "scripts",
+                    {},
+                )
+
+                if "test" in scripts:
+                    commands.append(
+                        [
+                            "npm",
+                            "test",
+                            "--",
+                            "--runInBand",
+                        ]
+                    )
+
+            except Exception:
+                pass
+
+    elif ptype == "go":
+
+        commands.append(
+            [
+                "go",
+                "test",
+                "./...",
+            ]
+        )
+
+    elif ptype == "rust":
+
+        commands.append(
+            [
+                "cargo",
+                "test",
+            ]
+        )
+
+    elif ptype == "java-maven":
+
+        commands.append(
+            [
+                "./mvnw",
+                "test",
+            ]
+            if (workspace / "mvnw").exists()
+            else [
+                "mvn",
+                "test",
+            ]
+        )
+
+    elif ptype == "java-gradle":
+
+        commands.append(
+            [
+                "./gradlew",
+                "test",
+            ]
+            if (workspace / "gradlew").exists()
+            else [
+                "gradle",
+                "test",
+            ]
+        )
+
+    return commands
+
+
+def build_commands(
+    project: Dict[str, Any],
+    workspace: Path,
+) -> List[List[str]]:
+
+    ptype = project.get(
+        "type",
+        "unknown",
     )
 
-    session.log(
-        "info",
-        "tool",
-        f"Executing {name}",
-        action=name,
-        path=action.get("path"),
+    if ptype == "node":
+
+        package_json = workspace / "package.json"
+
+        if package_json.exists():
+
+            try:
+                package = json.loads(
+                    package_json.read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+                scripts = package.get(
+                    "scripts",
+                    {},
+                )
+
+                if "build" in scripts:
+                    return [
+                        [
+                            "npm",
+                            "run",
+                            "build",
+                        ]
+                    ]
+
+            except Exception:
+                pass
+
+    return []
+
+
+def typecheck_commands(
+    project: Dict[str, Any],
+    workspace: Path,
+) -> List[List[str]]:
+
+    ptype = project.get(
+        "type",
+        "unknown",
     )
 
-    # -----------------------------
-    # FILES
-    # -----------------------------
+    if ptype == "node":
+
+        package_json = workspace / "package.json"
+
+        if package_json.exists():
+
+            try:
+                package = json.loads(
+                    package_json.read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+                scripts = package.get(
+                    "scripts",
+                    {},
+                )
+
+                if "typecheck" in scripts:
+                    return [
+                        [
+                            "npm",
+                            "run",
+                            "typecheck",
+                        ]
+                    ]
+
+                if (
+                    (workspace / "tsconfig.json").exists()
+                ):
+                    return [
+                        [
+                            "npx",
+                            "tsc",
+                            "--noEmit",
+                        ]
+                    ]
+
+            except Exception:
+                pass
+
+    return []
+
+
+# ============================================================
+# AGENT CONTEXT
+# ============================================================
+
+def workspace_context(
+    session: AgentSession,
+) -> Dict[str, Any]:
+
+    if not session.workspace:
+        return {}
+
+    return {
+        "session_id": session.id,
+        "mode": session.mode,
+        "authorized": session.authorized,
+        "repository": session.repository,
+        "project": session.project,
+        "tree": list_tree(
+            session.workspace,
+            max_items=1000,
+        ),
+        "git_status": git_status(
+            session.workspace
+        ),
+    }
+
+
+# ============================================================
+# AGENT ACTION EXECUTION
+# ============================================================
+
+def execute_agent_action(
+    session: AgentSession,
+    action: Dict[str, Any],
+) -> Dict[str, Any]:
+
+    name = action.get("action")
+
+    if not name:
+        return {
+            "ok": False,
+            "error": "Missing action.",
+        }
+
+    workspace = session.workspace
+
+    if not workspace:
+        return {
+            "ok": False,
+            "error": "No active workspace.",
+        }
+
+    # --------------------------------------------------------
+    # LIST FILES
+    # --------------------------------------------------------
 
     if name == "list_files":
 
         return {
+            "ok": True,
             "files": list_tree(
-                root
-            )
+                workspace
+            ),
         }
+
+    # --------------------------------------------------------
+    # READ FILE
+    # --------------------------------------------------------
 
     if name == "read_file":
 
-        return {
-            "path": action.get(
-                "path"
-            ),
-            "content": read_file(
-                root,
-                action.get(
-                    "path",
-                    "",
-                ),
-            ),
-        }
+        path = safe_path(
+            session,
+            action.get("path", ""),
+        )
+
+        try:
+            content = read_file(path)
+
+            return {
+                "ok": True,
+                "path": action.get("path"),
+                "content": content,
+            }
+
+        except Exception as exc:
+
+            return {
+                "ok": False,
+                "error": str(exc),
+            }
+
+    # --------------------------------------------------------
+    # SEARCH
+    # --------------------------------------------------------
 
     if name == "search_files":
 
+        query = str(
+            action.get("query", "")
+        )
+
         return {
-            "query": action.get(
-                "query",
-                "",
-            ),
-            "matches": search_files(
-                root,
-                str(
-                    action.get(
-                        "query",
-                        "",
-                    )
-                ),
+            "ok": True,
+            "results": search_files(
+                workspace,
+                query,
             ),
         }
+
+    # --------------------------------------------------------
+    # WRITE FILE
+    # --------------------------------------------------------
 
     if name == "write_file":
 
-        return write_file(
-            root,
-            action.get(
-                "path",
-                "",
-            ),
-            action.get(
-                "content",
-                "",
-            ),
+        path = safe_path(
+            session,
+            action.get("path", ""),
         )
 
-    if name == "delete_file":
-
-        relative = action.get(
-            "path",
+        content = action.get(
+            "content",
             "",
         )
 
-        if (
-            ".git"
-            in Path(relative).parts
-        ):
-            raise ValueError(
-                "Cannot modify .git."
-            )
-
-        return delete_file(
-            root,
-            relative,
-        )
-
-    # -----------------------------
-    # TERMINAL
-    # -----------------------------
-
-    if name == "terminal":
-
-        command = str(
-            action.get(
-                "command",
-                "",
-            )
-        )
-
-        return run_terminal(
-            root,
-            command,
-        )
-
-    # -----------------------------
-    # TEST
-    # -----------------------------
-
-    if name == "run_test":
-
-        commands = (
-            session.project
-            .get(
-                "test_commands",
-                [],
-            )
-        )
-
-        if not commands:
-
+        if not isinstance(content, str):
             return {
-                "skipped": True,
-                "reason": (
-                    "No test command detected."
+                "ok": False,
+                "error": "content must be a string.",
+            }
+
+        if len(content.encode("utf-8")) > MAX_FILE_SIZE:
+            return {
+                "ok": False,
+                "error": "File exceeds MAX_FILE_SIZE.",
+            }
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        path.write_text(
+            content,
+            encoding="utf-8",
+        )
+
+        return {
+            "ok": True,
+            "action": "write_file",
+            "path": action.get("path"),
+        }
+
+    # --------------------------------------------------------
+    # DELETE FILE
+    # --------------------------------------------------------
+
+    if name == "delete_file":
+
+        path = safe_path(
+            session,
+            action.get("path", ""),
+        )
+
+        if not path.exists():
+            return {
+                "ok": False,
+                "error": "File does not exist.",
+            }
+
+        if path.is_dir():
+            return {
+                "ok": False,
+                "error": (
+                    "Directory deletion is disabled "
+                    "for agent safety."
                 ),
             }
 
-        results = []
-
-        for command in commands:
-
-            result = run_process(
-                command,
-                root,
-            )
-
-            results.append(
-                result
-            )
-
-            if result["success"]:
-                break
+        path.unlink()
 
         return {
-            "success": any(
-                x["success"]
-                for x in results
-            ),
-            "results": results,
+            "ok": True,
+            "action": "delete_file",
+            "path": action.get("path"),
         }
 
-    # -----------------------------
-    # BUILD
-    # -----------------------------
-
-    if name == "run_build":
-
-        commands = (
-            session.project
-            .get(
-                "build_commands",
-                [],
-            )
-        )
-
-        if not commands:
-
-            return {
-                "skipped": True,
-                "reason": (
-                    "No build command detected."
-                ),
-            }
-
-        results = []
-
-        for command in commands:
-
-            result = run_process(
-                command,
-                root,
-            )
-
-            results.append(
-                result
-            )
-
-            if result["success"]:
-                break
-
-        return {
-            "success": any(
-                x["success"]
-                for x in results
-            ),
-            "results": results,
-        }
-
-    # -----------------------------
-    # TYPECHECK
-    # -----------------------------
-
-    if name == "run_typecheck":
-
-        commands = (
-            session.project
-            .get(
-                "typecheck_commands",
-                [],
-            )
-        )
-
-        if not commands:
-
-            return {
-                "skipped": True,
-                "reason": (
-                    "No typecheck command detected."
-                ),
-            }
-
-        results = []
-
-        for command in commands:
-
-            result = run_process(
-                command,
-                root,
-            )
-
-            results.append(
-                result
-            )
-
-            if result["success"]:
-                break
-
-        return {
-            "success": any(
-                x["success"]
-                for x in results
-            ),
-            "results": results,
-        }
-
-    # -----------------------------
-    # GIT
-    # -----------------------------
+    # --------------------------------------------------------
+    # GIT STATUS
+    # --------------------------------------------------------
 
     if name == "git_status":
 
-        return git_status(
-            root
-        )
+        return git_status(workspace)
+
+    # --------------------------------------------------------
+    # GIT DIFF
+    # --------------------------------------------------------
 
     if name == "git_diff":
 
-        return git_diff(
-            root
+        return git_diff(workspace)
+
+    # --------------------------------------------------------
+    # TEST
+    # --------------------------------------------------------
+
+    if name == "run_test":
+
+        commands = test_commands(
+            session.project or {},
+            workspace,
         )
 
-    if name == "git_branch":
-
-        branch = str(
-            action.get(
-                "branch",
-                ""
-            )
-        )
-
-        return git_create_branch(
-            root,
-            branch,
-        )
-
-    if name == "git_commit":
-
-        return git_commit(
-            root,
-            str(
-                action.get(
-                    "message",
-                    "",
-                )
-            ),
-        )
-
-    if name == "git_push":
-
-        if not AUTO_PUSH:
-
+        if not commands:
             return {
-                "success": False,
+                "ok": True,
                 "skipped": True,
                 "reason": (
-                    "AUTO_PUSH is disabled."
+                    "No automatic test command "
+                    "was detected."
                 ),
             }
 
-        branch = (
-            session.repository
-            .get(
-                "branch",
-            )
+        command = commands[0]
+
+        result = run_process(
+            command,
+            workspace,
+            timeout=COMMAND_TIMEOUT,
         )
 
-        if not branch:
+        session.test_iterations += 1
 
-            branch_result = run_process(
-                [
-                    "git",
-                    "branch",
-                    "--show-current",
-                ],
-                root,
-            )
+        return {
+            **result,
+            "operation": "test",
+        }
 
-            branch = (
-                branch_result[
-                    "stdout"
-                ].strip()
-            )
+    # --------------------------------------------------------
+    # BUILD
+    # --------------------------------------------------------
 
-        return git_push(
-            root,
-            branch,
+    if name == "run_build":
+
+        commands = build_commands(
+            session.project or {},
+            workspace,
         )
 
-    # -----------------------------
+        if not commands:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": (
+                    "No automatic build command "
+                    "was detected."
+                ),
+            }
+
+        return {
+            **run_process(
+                commands[0],
+                workspace,
+                timeout=COMMAND_TIMEOUT,
+            ),
+            "operation": "build",
+        }
+
+    # --------------------------------------------------------
+    # TYPECHECK
+    # --------------------------------------------------------
+
+    if name == "run_typecheck":
+
+        commands = typecheck_commands(
+            session.project or {},
+            workspace,
+        )
+
+        if not commands:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": (
+                    "No automatic typecheck "
+                    "command was detected."
+                ),
+            }
+
+        return {
+            **run_process(
+                commands[0],
+                workspace,
+                timeout=COMMAND_TIMEOUT,
+            ),
+            "operation": "typecheck",
+        }
+
+    # --------------------------------------------------------
+    # COMMAND
+    # --------------------------------------------------------
+
+    if name == "run_command":
+
+        command = action.get("command")
+
+        if not isinstance(command, list):
+            return {
+                "ok": False,
+                "error": (
+                    "run_command requires command "
+                    "as an array."
+                ),
+            }
+
+        if not command:
+            return {
+                "ok": False,
+                "error": "Empty command.",
+            }
+
+        # Prevent obvious secret/environment exfiltration.
+        joined = " ".join(
+            str(x)
+            for x in command
+        ).lower()
+
+        forbidden_patterns = [
+            "github_token",
+            "gemini_api_key",
+            "openai_api_key",
+            "printenv",
+            "env",
+        ]
+
+        if any(
+            pattern in joined
+            for pattern in forbidden_patterns
+        ):
+            return {
+                "ok": False,
+                "error": (
+                    "Command blocked because it "
+                    "may expose secrets."
+                ),
+            }
+
+        return run_process(
+            [
+                str(x)
+                for x in command
+            ],
+            workspace,
+            timeout=COMMAND_TIMEOUT,
+        )
+
+    # --------------------------------------------------------
     # FINISH
-    # -----------------------------
+    # --------------------------------------------------------
 
     if name == "finish":
 
         return {
-            "finished": True
+            "ok": True,
+            "finished": True,
+            "summary": action.get(
+                "summary",
+                "Work completed.",
+            ),
         }
 
-    raise ValueError(
-        "Action was not executed."
-    )
-
-
-# ============================================================
-# FASTAPI
-# ============================================================
-
-app = FastAPI(
-    title="Open Agent",
-    version="2.0.0",
-    description=(
-        "Manus-style autonomous AI software engineering agent."
-    ),
-)
-
-
-origins = [
-    item.strip()
-    for item in os.getenv(
-        "FRONTEND_ORIGINS",
-        "*",
-    ).split(",")
-    if item.strip()
-]
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ============================================================
-# REQUEST MODELS
-# ============================================================
-
-class ChatRequest(BaseModel):
-
-    message: str = Field(
-        min_length=1,
-        max_length=30000,
-    )
-
-    conversation_context: Any = None
-
-
-class PlanRequest(BaseModel):
-
-    task: str = Field(
-        min_length=1,
-        max_length=30000,
-    )
-
-    conversation_context: Any = None
-
-    repo_url: str | None = None
-
-
-class FinalizeRequest(PlanRequest):
-
-    draft_plan: Any
-
-
-class RepoRequest(BaseModel):
-
-    repo_url: str
-
-
-class ReadRequest(RepoRequest):
-
-    file_path: str
-
-
-class SearchRequest(RepoRequest):
-
-    query: str = Field(
-        min_length=1,
-        max_length=500,
-    )
-
-
-class WorkPrepareRequest(BaseModel):
-
-    session_id: str
-
-    repo_url: str
-
-    task: str
-
-    approved_plan: Any
-
-
-class WorkExecuteRequest(BaseModel):
-
-    session_id: str
-
-    task: str
-
-    approved_plan: Any
-
-
-class TerminalRequest(BaseModel):
-
-    session_id: str
-
-    command: str
-
-    timeout: int | None = None
-
-
-class EditRequest(BaseModel):
-
-    session_id: str
-
-    file_path: str
-
-    content: str
-
-    commit_message: str = Field(
-        min_length=5,
-        max_length=200,
-    )
-
-
-class CommitRequest(BaseModel):
-
-    session_id: str
-
-    message: str = Field(
-        min_length=5,
-        max_length=200,
-    )
-
-
-class PushRequest(BaseModel):
-
-    session_id: str
-
-
-class BranchRequest(BaseModel):
-
-    session_id: str
-
-    branch: str
-
-
-class StopRequest(BaseModel):
-
-    session_id: str
-
-
-# ============================================================
-# ROOT / HEALTH
-# ============================================================
-
-@app.get("/")
-def root():
-
     return {
-        "name": "Open Agent",
-        "version": "2.0.0",
-        "status": "online",
-        "docs": "/docs",
-        "capabilities": {
-            "chat": True,
-            "plan_mode": True,
-            "work_mode": True,
-            "github": True,
-            "repository_read": True,
-            "repository_search": True,
-            "multi_file_edit": True,
-            "terminal": True,
-            "testing": True,
-            "build": True,
-            "typecheck": True,
-            "error_fix_loop": True,
-            "git_status": True,
-            "git_diff": True,
-            "git_branch": True,
-            "git_commit": True,
-            "git_push": True,
-            "zip": True,
-        },
-    }
-
-
-@app.get("/health")
-def health():
-
-    return {
-        "status": "ok",
-        "model": GEMINI_MODEL,
-        "gemini_configured": bool(
-            os.getenv(
-                "GEMINI_API_KEY"
-            )
+        "ok": False,
+        "error": (
+            f"Unknown agent action: {name}"
         ),
-        "github_configured": bool(
-            os.getenv(
-                "GITHUB_TOKEN"
-            )
-        ),
-        "capabilities": {
-            "chat": True,
-            "plan_mode": True,
-            "work_mode": True,
-            "github_read": True,
-            "github_edit": True,
-            "multi_file_edit": True,
-            "terminal": True,
-            "auto_testing": True,
-            "auto_build": True,
-            "typecheck": True,
-            "error_fix_loop": True,
-            "git_status": True,
-            "git_diff": True,
-            "git_branch": True,
-            "commit": True,
-            "push": bool(
-                os.getenv(
-                    "GITHUB_TOKEN"
-                )
-            ),
-            "zip": True,
-        },
     }
 
 
 # ============================================================
-# CHAT MODE
+# AI ACTION PLANNER
 # ============================================================
 
-@app.post("/chat")
-def chat(
-    request: ChatRequest,
-):
+def agent_action_prompt(
+    session: AgentSession,
+    task: str,
+    history: List[Dict[str, Any]],
+) -> str:
 
-    prompt = f"""
-{CHAT_SYSTEM}
+    context = workspace_context(
+        session
+    )
 
-Conversation context:
-{context_text(request.conversation_context)}
+    recent_history = history[-12:]
 
-User:
-{request.message}
+    return f"""
+You are operating Open Agent Work Mode.
+
+USER TASK:
+{task}
+
+CURRENT BACKEND CAPABILITIES:
+{json.dumps(CAPABILITIES, indent=2)}
+
+CURRENT SESSION:
+{json.dumps(
+    {
+        "id": session.id,
+        "authorized": session.authorized,
+        "project": session.project,
+        "repository": session.repository,
+        "iterations": session.iterations,
+        "test_iterations": session.test_iterations,
+    },
+    indent=2,
+)}
+
+CURRENT WORKSPACE CONTEXT:
+{json.dumps(
+    context,
+    indent=2,
+    default=str,
+)}
+
+RECENT AGENT HISTORY:
+{json.dumps(
+    recent_history,
+    indent=2,
+    default=str,
+)}
+
+AVAILABLE ACTIONS:
+
+1. list_files
+2. read_file
+3. search_files
+4. write_file
+5. delete_file
+6. git_status
+7. git_diff
+8. run_test
+9. run_build
+10. run_typecheck
+11. run_command
+12. finish
+
+ACTION FORMAT:
+
+Return ONLY valid JSON.
+
+Examples:
+
+{{"action":"list_files"}}
+
+{{"action":"read_file","path":"src/main.py"}}
+
+{{"action":"search_files","query":"login"}}
+
+{{"action":"write_file","path":"src/main.py","content":"..."}}
+
+{{"action":"delete_file","path":"old.js"}}
+
+{{"action":"run_test"}}
+
+{{"action":"run_build"}}
+
+{{"action":"run_typecheck"}}
+
+{{"action":"run_command","command":["npm","install"]}}
+
+{{"action":"git_status"}}
+
+{{"action":"git_diff"}}
+
+{{"action":"finish","summary":"Implemented and verified the requested changes."}}
+
+RULES:
+
+- Inspect before editing.
+- Read relevant files before changing them.
+- Use multiple files when necessary.
+- Do not rewrite unrelated files.
+- Do not fabricate results.
+- After modifications, inspect git diff.
+- Run appropriate tests.
+- If tests fail, diagnose and fix.
+- Retest after fixes.
+- Use build/typecheck when relevant.
+- Do not finish immediately after a failed test.
+- Stay inside the active workspace.
+- Never expose secrets.
+- Do not return markdown.
+- Return exactly one JSON action.
 """
 
-    reply = GEMINI.text(
-        prompt
+
+# ============================================================
+# AUTONOMOUS WORK LOOP
+# ============================================================
+
+def autonomous_worker(
+    session: AgentSession,
+    task: str,
+) -> None:
+
+    session.started_at = time.time()
+    session.status = "working"
+    session.cancelled = False
+    session.task = task
+
+    log_event(
+        session,
+        "work_started",
+        "Open Agent started autonomous work.",
+    )
+
+    history: List[Dict[str, Any]] = []
+
+    started = time.time()
+
+    try:
+
+        while (
+            session.iterations
+            < MAX_AGENT_ITERATIONS
+        ):
+
+            if session.cancelled:
+                session.status = "stopped"
+
+                log_event(
+                    session,
+                    "work_stopped",
+                    "Work stopped by user.",
+                )
+
+                return
+
+            if (
+                time.time() - started
+                > WORKSPACE_TIMEOUT
+            ):
+                session.status = "failed"
+
+                log_event(
+                    session,
+                    "timeout",
+                    "Maximum work session timeout reached.",
+                )
+
+                return
+
+            session.iterations += 1
+
+            log_event(
+                session,
+                "agent_iteration",
+                f"Agent iteration {session.iterations}",
+                {
+                    "iteration": session.iterations,
+                },
+            )
+
+            prompt = agent_action_prompt(
+                session,
+                task,
+                history,
+            )
+
+            try:
+
+                response = asyncio.run(
+                    gemini_service.text(
+                        prompt,
+                        system=AGENT_SYSTEM_PROMPT,
+                        temperature=0.15,
+                    )
+                )
+
+            except Exception as exc:
+
+                log_event(
+                    session,
+                    "ai_error",
+                    str(exc),
+                )
+
+                session.status = "failed"
+                return
+
+            action = extract_json(response)
+
+            if not isinstance(action, dict):
+
+                log_event(
+                    session,
+                    "invalid_action",
+                    "AI returned invalid action JSON.",
+                    {
+                        "response": response[:5000],
+                    },
+                )
+
+                history.append(
+                    {
+                        "type": "error",
+                        "error": (
+                            "Invalid JSON action "
+                            "returned by AI."
+                        ),
+                    }
+                )
+
+                continue
+
+            action_name = action.get(
+                "action",
+                "unknown",
+            )
+
+            log_event(
+                session,
+                "agent_action",
+                f"Executing {action_name}",
+                {
+                    "action": action_name,
+                },
+            )
+
+            result = execute_agent_action(
+                session,
+                action,
+            )
+
+            # Never expose potentially sensitive
+            # command arguments or environment data.
+            safe_result = dict(result)
+
+            history.append(
+                {
+                    "action": action,
+                    "result": safe_result,
+                }
+            )
+
+            log_event(
+                session,
+                "action_result",
+                f"{action_name} completed.",
+                {
+                    "ok": result.get("ok"),
+                    "operation": result.get(
+                        "operation"
+                    ),
+                    "returncode": result.get(
+                        "returncode"
+                    ),
+                    "stdout": result.get(
+                        "stdout",
+                        "",
+                    )[-10000:],
+                    "stderr": result.get(
+                        "stderr",
+                        "",
+                    )[-10000:],
+                },
+            )
+
+            # ------------------------------------------------
+            # TEST FAILURE
+            # ------------------------------------------------
+
+            if (
+                action_name in {
+                    "run_test",
+                    "run_build",
+                    "run_typecheck",
+                    "run_command",
+                }
+                and result.get("ok") is False
+            ):
+
+                if (
+                    session.test_iterations
+                    >= MAX_TEST_ITERATIONS
+                ):
+
+                    log_event(
+                        session,
+                        "test_limit",
+                        (
+                            "Maximum test/fix "
+                            "iterations reached."
+                        ),
+                    )
+
+                    # Let AI make final assessment.
+                    history.append(
+                        {
+                            "type": "test_limit",
+                            "message": (
+                                "Maximum test iterations "
+                                "reached."
+                            ),
+                        }
+                    )
+
+                else:
+
+                    log_event(
+                        session,
+                        "error_detected",
+                        (
+                            "Failure detected. "
+                            "Agent should diagnose and fix."
+                        ),
+                        {
+                            "stderr": result.get(
+                                "stderr",
+                                "",
+                            )[-10000:],
+                        },
+                    )
+
+            # ------------------------------------------------
+            # FINISH
+            # ------------------------------------------------
+
+            if (
+                action_name == "finish"
+                and result.get("finished")
+            ):
+
+                log_event(
+                    session,
+                    "final_review",
+                    "Running final git status and diff.",
+                )
+
+                final_status = git_status(
+                    session.workspace
+                )
+
+                final_diff = git_diff(
+                    session.workspace
+                )
+
+                log_event(
+                    session,
+                    "final_state",
+                    "Final workspace state collected.",
+                    {
+                        "git_status": final_status,
+                        "git_diff": final_diff,
+                    },
+                )
+
+                session.status = "completed"
+                session.finished_at = time.time()
+
+                log_event(
+                    session,
+                    "work_completed",
+                    result.get(
+                        "summary",
+                        "Work completed.",
+                    ),
+                )
+
+                # Optional automatic push.
+                if AUTO_PUSH and GITHUB_TOKEN:
+
+                    log_event(
+                        session,
+                        "auto_push",
+                        "AUTO_PUSH is enabled. Pushing changes.",
+                    )
+
+                    push_result = git_push(
+                        session.workspace
+                    )
+
+                    log_event(
+                        session,
+                        "push_result",
+                        (
+                            "Automatic push completed."
+                            if push_result.get("ok")
+                            else "Automatic push failed."
+                        ),
+                        {
+                            "ok": push_result.get(
+                                "ok"
+                            ),
+                            "stderr": push_result.get(
+                                "stderr",
+                                "",
+                            )[-10000:],
+                            "stdout": push_result.get(
+                                "stdout",
+                                "",
+                            )[-10000:],
+                        },
+                    )
+
+                return
+
+        session.status = "failed"
+
+        log_event(
+            session,
+            "iteration_limit",
+            (
+                "Maximum autonomous agent "
+                "iterations reached."
+            ),
+        )
+
+    except Exception as exc:
+
+        session.status = "failed"
+
+        log_event(
+            session,
+            "worker_exception",
+            str(exc),
+            {
+                "traceback": traceback.format_exc()[
+                    -10000:
+                ]
+            },
+        )
+
+    finally:
+
+        session.finished_at = time.time()
+
+
+# ============================================================
+# CHAT
+# ============================================================
+
+async def process_chat(
+    message: str,
+) -> str:
+
+    prompt = f"""
+User message:
+
+{message}
+
+Respond naturally and helpfully.
+
+You are Open Agent.
+
+If the user asks what you can do, explain your real backend
+capabilities based on the capability specification.
+
+Do not falsely claim repository access unless the backend
+capability/session provides it.
+
+Do not claim that code was changed unless Work Mode actually
+performed the operation.
+
+Do not claim tests passed unless actual test output confirms it.
+"""
+
+    return await gemini_service.text(
+        prompt,
+        system=AGENT_SYSTEM_PROMPT,
+        temperature=0.35,
+    )
+
+
+@app.post("/chat")
+async def chat(
+    request: Request,
+):
+    """
+    Compatible with both:
+
+    JSON:
+        {"message":"Hi"}
+
+    and:
+
+        application/x-www-form-urlencoded
+        message=Hi
+    """
+
+    content_type = (
+        request.headers.get(
+            "content-type",
+            "",
+        )
+        .lower()
+    )
+
+    message: Optional[str] = None
+
+    try:
+
+        if "application/json" in content_type:
+
+            body = await request.json()
+
+            if isinstance(body, dict):
+                message = body.get(
+                    "message"
+                )
+
+        elif (
+            "application/x-www-form-urlencoded"
+            in content_type
+            or "multipart/form-data"
+            in content_type
+        ):
+
+            form = await request.form()
+
+            message = form.get(
+                "message"
+            )
+
+        else:
+
+            # Graceful fallback.
+            try:
+
+                body = await request.json()
+
+                if isinstance(body, dict):
+                    message = body.get(
+                        "message"
+                    )
+
+            except Exception:
+
+                try:
+
+                    form = await request.form()
+
+                    message = form.get(
+                        "message"
+                    )
+
+                except Exception:
+                    pass
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid request body: {exc}",
+        )
+
+    if not message or not str(message).strip():
+
+        raise HTTPException(
+            status_code=422,
+            detail="message is required",
+        )
+
+    reply = await process_chat(
+        str(message).strip()
     )
 
     return {
         "ok": True,
-        "mode": "chat",
         "reply": reply,
     }
 
@@ -2390,49 +2619,67 @@ User:
 # ============================================================
 
 @app.post("/plan")
-def create_plan(
+async def create_plan(
     request: PlanRequest,
 ):
 
+    session = create_session(
+        mode="plan"
+    )
+
+    session.mode = "plan"
+
+    context = request.context or ""
+
     prompt = f"""
-{PLAN_SYSTEM}
+Create a professional software implementation plan.
 
-User task:
-{request.task}
+USER REQUIREMENT:
+{request.message}
 
-Repository:
-{request.repo_url or "No repository connected"}
+ADDITIONAL CONTEXT:
+{context}
 
-Conversation:
-{context_text(request.conversation_context)}
+The plan must include:
 
-Return JSON with:
+1. Understanding
+2. Goals
+3. Relevant project areas
+4. Files likely to change
+5. Implementation steps
+6. Multi-file considerations
+7. Testing strategy
+8. Build/typecheck strategy
+9. Risks
+10. Definition of done
 
-{{
-  "goal": "...",
-  "requirements": [],
-  "architecture": [],
-  "files": [],
-  "new_files": [],
-  "dependencies": [],
-  "steps": [],
-  "tests": [],
-  "build": [],
-  "risks": [],
-  "assumptions": [],
-  "clarifying_questions": []
-}}
+Do NOT modify files.
+
+Return a clear human-readable plan.
 """
 
-    result = GEMINI.text(
+    plan = await gemini_service.text(
         prompt,
-        json_mode=True,
+        system=AGENT_SYSTEM_PROMPT,
+        temperature=0.25,
+    )
+
+    session.plan = plan
+    session.task = request.message
+    session.status = "planned"
+
+    log_event(
+        session,
+        "plan_created",
+        "Implementation plan created.",
     )
 
     return {
         "ok": True,
+        "session_id": session.id,
         "mode": "plan",
-        "plan": result,
+        "plan": plan,
+        "finalized": False,
     }
 
 
@@ -2441,927 +2688,221 @@ Return JSON with:
 # ============================================================
 
 @app.post("/plan/finalize")
-def finalize_plan(
-    request: FinalizeRequest,
+async def finalize_plan(
+    request: FinalizePlanRequest,
 ):
 
-    prompt = f"""
-Finalize the following software implementation plan.
+    session = get_session(
+        request.session_id
+    )
 
-Do not modify files.
+    if session.mode != "plan":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Only Plan Mode sessions "
+                "can be finalized."
+            ),
+        )
 
-Do not invent repository facts.
+    if request.plan:
+        session.plan = request.plan
 
-Return ONLY JSON:
+    if not session.plan:
+        raise HTTPException(
+            status_code=400,
+            detail="No plan exists.",
+        )
 
-{{
-  "goal": "...",
-  "requirements": [],
-  "architecture": [],
-  "files": [],
-  "changes": [],
-  "dependencies": [],
-  "tests": [],
-  "build": [],
-  "risks": [],
-  "steps": []
-}}
+    session.plan_finalized = True
+    session.authorized = False
+    session.status = "plan_finalized"
 
-Task:
-{request.task}
-
-Draft plan:
-{json.dumps(
-    request.draft_plan,
-    ensure_ascii=False
-)}
-
-Conversation:
-{context_text(
-    request.conversation_context
-)}
-"""
-
-    result = GEMINI.text(
-        prompt,
-        json_mode=True,
+    log_event(
+        session,
+        "plan_finalized",
+        (
+            "Plan finalized. "
+            "Work authorization is still required."
+        ),
     )
 
     return {
         "ok": True,
-        "mode": "finalized",
-        "approved_plan": result,
-        "work_authorization_required": True,
+        "session_id": session.id,
+        "plan": session.plan,
+        "finalized": True,
+        "work_authorized": False,
+        "requires_authorization": True,
     }
 
 
 # ============================================================
-# REPOSITORY INSPECTION
+# REPOSITORY INSPECT
 # ============================================================
 
-def temporary_clone(
-    repo_url: str,
-):
-
-    session_id = (
-        "inspect-"
-        + uuid.uuid4().hex[:12]
-    )
-
-    workspace = new_workspace(
-        session_id
-    )
-
-    repo = clone_repo(
-        repo_url,
-        workspace / "repo",
-    )
-
-    return workspace, repo
-
-
 @app.post("/repository/inspect")
-def repository_inspect(
+async def repository_inspect(
     request: RepoRequest,
 ):
 
-    workspace, repository = (
-        temporary_clone(
-            request.repo_url
-        )
+    session = create_session(
+        mode="repository"
     )
 
-    try:
+    workspace = (
+        WORKSPACE_ROOT
+        / session.id
+        / "repo"
+    )
 
-        root = (
-            workspace / "repo"
-        )
+    result = clone_repo(
+        request.repository_url,
+        request.branch,
+        workspace,
+    )
 
-        project = detect_project(
-            root
-        )
+    session.workspace = workspace
+    session.repository = {
+        "url": request.repository_url,
+        "branch": request.branch,
+    }
 
-        return {
-            "ok": True,
-            "repository": repository,
-            "project": {
-                k: v
-                for k, v
-                in project.items()
-                if k
-                not in {
-                    "files",
-                    "test_commands",
-                    "build_commands",
-                    "typecheck_commands",
-                }
-            },
-            "files": project[
-                "files"
-            ],
-            "commands": {
-                "test": project[
-                    "test_commands"
-                ],
-                "build": project[
-                    "build_commands"
-                ],
-                "typecheck": project[
-                    "typecheck_commands"
-                ],
-            },
-        }
+    session.project = detect_project(
+        workspace
+    )
 
-    finally:
+    session.status = "ready"
 
-        shutil.rmtree(
-            workspace,
-            ignore_errors=True,
-        )
+    return {
+        "ok": True,
+        "session_id": session.id,
+        "repository": session.repository,
+        "project": session.project,
+        "tree": list_tree(workspace),
+    }
 
+
+# ============================================================
+# READ FILE
+# ============================================================
 
 @app.post("/repository/read")
-def repository_read(
-    request: ReadRequest,
+async def repository_read(
+    request: ReadFileRequest,
 ):
 
-    workspace, repository = (
-        temporary_clone(
-            request.repo_url
-        )
+    session = get_session(
+        request.session_id
+    )
+
+    path = safe_path(
+        session,
+        request.path,
     )
 
     try:
 
-        content = read_file(
-            workspace / "repo",
-            request.file_path,
-        )
-
         return {
             "ok": True,
-            "repository": repository,
-            "path": request.file_path,
-            "content": content,
+            "path": request.path,
+            "content": read_file(path),
         }
 
-    finally:
+    except FileNotFoundError:
 
-        shutil.rmtree(
-            workspace,
-            ignore_errors=True,
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
         )
 
 
+# ============================================================
+# SEARCH
+# ============================================================
+
 @app.post("/repository/search")
-def repository_search(
+async def repository_search(
     request: SearchRequest,
 ):
 
-    workspace, repository = (
-        temporary_clone(
-            request.repo_url
-        )
-    )
-
-    try:
-
-        matches = search_files(
-            workspace / "repo",
-            request.query,
-        )
-
-        return {
-            "ok": True,
-            "repository": repository,
-            "query": request.query,
-            "matches": matches,
-        }
-
-    finally:
-
-        shutil.rmtree(
-            workspace,
-            ignore_errors=True,
-        )
-
-
-# ============================================================
-# WORK PREPARE
-# ============================================================
-
-@app.post("/work/prepare")
-def work_prepare(
-    request: WorkPrepareRequest,
-):
-
-    if not request.approved_plan:
-        raise api_error(
-            "PLAN_REQUIRED",
-            "A finalized approved plan is required.",
-        )
-
-    workspace = new_workspace(
-        request.session_id
-    )
-
-    session = Session(
-        id=request.session_id,
-        mode="work",
-        workspace=workspace,
-        task=request.task,
-        approved_plan=request.approved_plan,
-    )
-
-    SESSIONS[
-        request.session_id
-    ] = session
-
-    try:
-
-        repository = clone_repo(
-            request.repo_url,
-            workspace / "repo",
-        )
-
-        session.repository = (
-            repository
-        )
-
-        root = (
-            workspace / "repo"
-        )
-
-        branch = (
-            f"open-agent/"
-            f"{request.session_id}"
-        )
-
-        branch_result = (
-            git_create_branch(
-                root,
-                branch,
-            )
-        )
-
-        if not branch_result[
-            "success"
-        ]:
-
-            raise api_error(
-                "BRANCH_FAILED",
-                branch_result[
-                    "stderr"
-                ],
-                400,
-            )
-
-        session.repository[
-            "branch"
-        ] = branch
-
-        session.project = (
-            detect_project(root)
-        )
-
-        session.status = (
-            "prepared"
-        )
-
-        session.log(
-            "info",
-            "workspace",
-            "Work Mode prepared.",
-            repository=repository,
-            branch=branch,
-        )
-
-        return {
-            "ok": True,
-            "session_id": session.id,
-            "status": session.status,
-            "repository": session.repository,
-            "project": session.project,
-        }
-
-    except Exception:
-
-        shutil.rmtree(
-            workspace,
-            ignore_errors=True,
-        )
-
-        SESSIONS.pop(
-            request.session_id,
-            None,
-        )
-
-        raise
-
-
-# ============================================================
-# WORK TERMINAL
-# ============================================================
-
-@app.post("/work/terminal")
-def work_terminal(
-    request: TerminalRequest,
-):
-
     session = get_session(
         request.session_id
     )
 
-    if session.mode != "work":
-        raise api_error(
-            "WORK_MODE_REQUIRED",
-            "Terminal requires Work Mode.",
+    if not session.workspace:
+        raise HTTPException(
+            status_code=400,
+            detail="No workspace.",
         )
 
-    if session.status not in {
-        "prepared",
-        "running",
-    }:
-
-        raise api_error(
-            "INVALID_SESSION_STATE",
-            "Work session is not executable.",
-        )
-
-    root = (
-        session.workspace / "repo"
-    )
-
-    try:
-
-        result = run_terminal(
-            root,
-            request.command,
-            request.timeout,
-        )
-
-        session.log(
-            "info",
-            "terminal",
-            f"Terminal executed: {request.command}",
-            result=result,
-        )
-
-        return {
-            "ok": True,
-            "result": result,
-        }
-
-    except subprocess.TimeoutExpired:
-
-        return {
-            "ok": False,
-            "result": {
-                "command": request.command,
-                "success": False,
-                "exit_code": -1,
-                "stderr": "Command timed out.",
-            },
-        }
-
-    except Exception as exc:
-
-        raise api_error(
-            "TERMINAL_ERROR",
-            redact(str(exc)),
-            400,
-        )
+    return {
+        "ok": True,
+        "query": request.query,
+        "results": search_files(
+            session.workspace,
+            request.query,
+        ),
+    }
 
 
 # ============================================================
-# WORK EDIT
+# DIRECT FILE EDIT
 # ============================================================
 
 @app.post("/repository/edit")
-def repository_edit(
-    request: EditRequest,
+async def repository_edit(
+    request: EditFileRequest,
 ):
 
     session = get_session(
         request.session_id
     )
 
-    if session.mode != "work":
-        raise api_error(
-            "WORK_MODE_REQUIRED",
-            "Work Mode is required.",
+    if not session.authorized:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "File modification requires "
+                "an authorized Work Mode session."
+            ),
         )
 
-    if session.status not in {
-        "prepared",
-        "running",
-    }:
-
-        raise api_error(
-            "INVALID_SESSION_STATE",
-            "Session is not editable.",
-        )
-
-    root = (
-        session.workspace / "repo"
+    path = safe_path(
+        session,
+        request.path,
     )
 
-    result = write_file(
-        root,
-        request.file_path,
+    if len(
+        request.content.encode("utf-8")
+    ) > MAX_FILE_SIZE:
+
+        raise HTTPException(
+            status_code=413,
+            detail="File too large.",
+        )
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    path.write_text(
         request.content,
-    )
-
-    diff = diff_summary(
-        root
+        encoding="utf-8",
     )
 
     return {
         "ok": True,
-        "edit": result,
-        "diff": diff,
-    }
-
-
-# ============================================================
-# WORK COMMIT
-# ============================================================
-
-@app.post("/work/commit")
-def work_commit(
-    request: CommitRequest,
-):
-
-    session = get_session(
-        request.session_id
-    )
-
-    if session.mode != "work":
-        raise api_error(
-            "WORK_MODE_REQUIRED",
-            "Work Mode is required.",
-        )
-
-    root = (
-        session.workspace / "repo"
-    )
-
-    diff = diff_summary(
-        root
-    )
-
-    if diff["total_changed"] == 0:
-
-        return {
-            "ok": True,
-            "committed": False,
-            "reason": "No changes to commit.",
-        }
-
-    result = git_commit(
-        root,
-        request.message,
-    )
-
-    return {
-        "ok": result["success"],
-        "commit": result,
-        "diff": diff_summary(
-            root
-        ),
-    }
-
-
-# ============================================================
-# WORK PUSH
-# ============================================================
-
-@app.post("/work/push")
-def work_push(
-    request: PushRequest,
-):
-
-    session = get_session(
-        request.session_id
-    )
-
-    if session.mode != "work":
-        raise api_error(
-            "WORK_MODE_REQUIRED",
-            "Work Mode is required.",
-        )
-
-    if not os.getenv(
-        "GITHUB_TOKEN"
-    ):
-
-        raise api_error(
-            "GITHUB_TOKEN_MISSING",
-            "GITHUB_TOKEN is not configured.",
-            503,
-        )
-
-    root = (
-        session.workspace / "repo"
-    )
-
-    branch = session.repository.get(
-        "branch"
-    )
-
-    if not branch:
-
-        result = run_process(
-            [
-                "git",
-                "branch",
-                "--show-current",
-            ],
-            root,
-        )
-
-        branch = (
-            result["stdout"]
-            .strip()
-        )
-
-    result = git_push(
-        root,
-        branch,
-    )
-
-    return {
-        "ok": result["success"],
-        "push": result,
-    }
-
-
-# ============================================================
-# AUTONOMOUS WORK LOOP
-# ============================================================
-
-@app.post("/work/execute")
-def work_execute(
-    request: WorkExecuteRequest,
-):
-
-    session = get_session(
-        request.session_id
-    )
-
-    if session.mode != "work":
-        raise api_error(
-            "WORK_MODE_REQUIRED",
-            "Work Mode is required.",
-        )
-
-    if (
-        request.task
-        != session.task
-    ):
-
-        raise api_error(
-            "TASK_MISMATCH",
-            "Task does not match authorization.",
-        )
-
-    if (
-        context_text(
-            request.approved_plan
-        )
-        != context_text(
-            session.approved_plan
-        )
-    ):
-
-        raise api_error(
-            "PLAN_MISMATCH",
-            "Approved plan does not match authorization.",
-        )
-
-    session.status = "running"
-
-    root = (
-        session.workspace / "repo"
-    )
-
-    last_result = None
-    consecutive_errors = 0
-
-    try:
-
-        for iteration in range(
-            1,
-            MAX_AGENT_ITERATIONS + 1,
-        ):
-
-            if session.cancelled:
-
-                session.status = (
-                    "stopped"
-                )
-
-                return {
-                    "ok": False,
-                    "status": "stopped",
-                    "reason": "Work cancelled.",
-                }
-
-            current_diff = (
-                diff_summary(
-                    root
-                )
-            )
-
-            recent_logs = (
-                session.iterations[
-                    -5:
-                ]
-            )
-
-            prompt = f"""
-{AGENT_SYSTEM}
-
-TASK:
-{session.task}
-
-APPROVED PLAN:
-{json.dumps(
-    session.approved_plan,
-    ensure_ascii=False
-)}
-
-REPOSITORY:
-{json.dumps(
-    session.repository,
-    ensure_ascii=False
-)}
-
-PROJECT:
-{json.dumps(
-    session.project,
-    ensure_ascii=False
-)}
-
-CURRENT DIFF:
-{json.dumps(
-    current_diff,
-    ensure_ascii=False
-)}
-
-LAST RESULT:
-{json.dumps(
-    last_result,
-    ensure_ascii=False
-)}
-
-RECENT ITERATIONS:
-{json.dumps(
-    recent_logs,
-    ensure_ascii=False
-)}
-
-Iteration:
-{iteration}
-
-Choose the NEXT best action.
-
-Important:
-- Inspect before editing.
-- Use multi-file edits when required.
-- Use terminal when project commands are necessary.
-- After implementation, test it.
-- If test/build/typecheck fails, diagnose and fix it.
-- Do not finish while known fixable errors remain.
-- Do not invent files or command output.
-"""
-
-            action = GEMINI.text(
-                prompt,
-                json_mode=True,
-            )
-
-            try:
-
-                result = execute_action(
-                    session,
-                    action,
-                )
-
-                consecutive_errors = 0
-
-            except Exception as exc:
-
-                result = {
-                    "success": False,
-                    "error": redact(
-                        str(exc)
-                    ),
-                }
-
-                consecutive_errors += 1
-
-                session.log(
-                    "error",
-                    "action_error",
-                    str(exc),
-                )
-
-                # Let the AI diagnose the
-                # actual error on the next loop.
-
-            record = {
-                "iteration": iteration,
-                "action": action,
-                "result": result,
-                "diff": diff_summary(
-                    root
-                ),
-                "timestamp": now(),
-            }
-
-            session.iterations.append(
-                record
-            )
-
-            last_result = result
-
-            if (
-                action.get(
-                    "action"
-                )
-                == "finish"
-            ):
-
-                session.status = (
-                    "completed"
-                )
-
-                break
-
-            # Prevent infinite broken loops.
-            if (
-                consecutive_errors
-                >= 5
-            ):
-
-                session.status = (
-                    "failed"
-                )
-
-                break
-
-        else:
-
-            session.status = (
-                "partial"
-            )
-
-        final_diff = diff_summary(
-            root
-        )
-
-        return {
-            "ok": session.status
-            in {
-                "completed",
-                "partial",
-            },
-            "status": session.status,
-            "session_id": session.id,
-            "repository": session.repository,
-            "files_changed": final_diff,
-            "iterations": session.iterations,
-            "summary": (
-                "Work completed."
-                if session.status
-                == "completed"
-                else
-                "Work stopped after the configured iteration limit."
-            ),
-        }
-
-    except Exception as exc:
-
-        session.status = (
-            "failed"
-        )
-
-        session.log(
-            "error",
-            "work",
-            "Autonomous execution failed.",
-            error=str(exc),
-        )
-
-        return {
-            "ok": False,
-            "status": "failed",
-            "error": redact(
-                str(exc)
-            ),
-            "files_changed": diff_summary(
-                root
-            ),
-            "iterations": session.iterations,
-        }
-
-
-# ============================================================
-# STOP
-# ============================================================
-
-@app.post("/work/stop")
-def work_stop(
-    request: StopRequest,
-):
-
-    session = get_session(
-        request.session_id
-    )
-
-    session.cancelled = True
-    session.status = "stopped"
-
-    session.log(
-        "warning",
-        "work",
-        "Cancellation requested.",
-    )
-
-    return {
-        "ok": True,
-        "status": "stopped",
-    }
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-@app.get(
-    "/work/status/{session_id}"
-)
-def work_status(
-    session_id: str,
-):
-
-    session = get_session(
-        session_id
-    )
-
-    root = (
-        session.workspace / "repo"
-    )
-
-    return {
-        "ok": True,
-        "session_id": session.id,
-        "mode": session.mode,
-        "status": session.status,
-        "cancelled": session.cancelled,
-        "repository": session.repository,
-        "project": {
-            "project_type":
-                session.project.get(
-                    "project_type"
-                ),
-            "framework":
-                session.project.get(
-                    "framework"
-                ),
-            "package_manager":
-                session.project.get(
-                    "package_manager"
-                ),
-        },
-        "files_changed": (
-            diff_summary(root)
-            if root.exists()
-            else {}
-        ),
-        "iterations": len(
-            session.iterations
-        ),
-    }
-
-
-@app.get(
-    "/work/logs/{session_id}"
-)
-def work_logs(
-    session_id: str,
-):
-
-    session = get_session(
-        session_id
-    )
-
-    return {
-        "ok": True,
-        "session_id": session.id,
-        "logs": session.logs,
-        "iterations": session.iterations,
+        "path": request.path,
+        "modified": True,
     }
 
 
@@ -3372,132 +2913,109 @@ def work_logs(
 @app.post("/project/upload")
 async def project_upload(
     file: UploadFile = File(...),
-    session_id: str = Form(...),
 ):
 
-    if (
-        not file.filename
-        or not file.filename.lower()
-        .endswith(".zip")
-    ):
-
-        raise api_error(
-            "INVALID_FILE",
-            "Only ZIP files are supported.",
-        )
-
-    workspace = new_workspace(
-        session_id
+    session = create_session(
+        mode="zip"
     )
 
-    session = Session(
-        id=session_id,
-        mode="work",
-        workspace=workspace,
-        task="Uploaded project",
-        approved_plan={},
+    destination = (
+        WORKSPACE_ROOT
+        / session.id
+        / "project"
     )
 
-    SESSIONS[
-        session_id
-    ] = session
-
-    archive = await file.read()
-
-    if len(archive) > (
-        MAX_FILE_SIZE * 100
-    ):
-
-        raise api_error(
-            "ARCHIVE_TOO_LARGE",
-            "ZIP archive is too large.",
-        )
-
-    root = (
-        workspace / "repo"
-    )
-
-    root.mkdir(
+    destination.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Filename is required.",
+        )
+
+    if not file.filename.lower().endswith(
+        ".zip"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Only ZIP files are supported.",
+        )
+
+    zip_path = (
+        UPLOAD_ROOT
+        / f"{session.id}.zip"
+    )
+
+    data = await file.read()
+
+    if len(data) > 100 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="ZIP file is too large.",
+        )
+
+    zip_path.write_bytes(data)
+
     try:
 
         with zipfile.ZipFile(
-            io.BytesIO(archive)
-        ) as archive_file:
+            zip_path,
+            "r",
+        ) as archive:
 
-            for entry in (
-                archive_file.infolist()
-            ):
+            for member in archive.infolist():
 
-                target = safe_path(
-                    root,
-                    entry.filename,
-                    allow_root=True,
-                )
+                member_path = (
+                    destination
+                    / member.filename
+                ).resolve()
 
-                if entry.is_dir():
-
-                    target.mkdir(
-                        parents=True,
-                        exist_ok=True,
+                try:
+                    member_path.relative_to(
+                        destination.resolve()
+                    )
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Unsafe ZIP path detected."
+                        ),
                     )
 
-                    continue
-
-                if (
-                    entry.file_size
-                    > MAX_FILE_SIZE
-                ):
-
-                    raise api_error(
-                        "FILE_TOO_LARGE",
-                        "ZIP entry is too large.",
-                    )
-
-                target.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                target.write_bytes(
-                    archive_file.read(
-                        entry
-                    )
-                )
+            archive.extractall(
+                destination
+            )
 
     except zipfile.BadZipFile:
 
-        raise api_error(
-            "INVALID_ZIP",
-            "Invalid ZIP archive.",
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ZIP file.",
         )
 
-    session.project = (
-        detect_project(root)
+    session.workspace = destination
+    session.project = detect_project(
+        destination
     )
-
-    session.status = (
-        "prepared"
-    )
+    session.status = "uploaded"
 
     return {
         "ok": True,
-        "session_id": session_id,
+        "session_id": session.id,
         "project": session.project,
+        "tree": list_tree(destination),
     }
 
 
 # ============================================================
-# ZIP DOWNLOAD
+# DOWNLOAD PROJECT
 # ============================================================
 
-@app.get(
-    "/project/download/{session_id}"
-)
-def project_download(
+@app.get("/project/download/{session_id}")
+async def project_download(
     session_id: str,
 ):
 
@@ -3505,117 +3023,606 @@ def project_download(
         session_id
     )
 
-    root = (
-        session.workspace / "repo"
-    )
-
-    if not root.exists():
-
-        raise api_error(
-            "PROJECT_NOT_FOUND",
-            "Project workspace not found.",
-            404,
+    if not session.workspace:
+        raise HTTPException(
+            status_code=400,
+            detail="No workspace.",
         )
 
-    archive_path = (
-        session.workspace
-        / "open-agent-result.zip"
+    output = (
+        EXPORT_ROOT
+        / f"{session.id}.zip"
     )
 
+    if output.exists():
+        output.unlink()
+
     with zipfile.ZipFile(
-        archive_path,
+        output,
         "w",
         zipfile.ZIP_DEFLATED,
     ) as archive:
 
-        for relative in list_tree(
-            root
-        ):
+        for path in session.workspace.rglob("*"):
 
-            path = safe_path(
-                root,
-                relative,
-            )
-
-            if (
-                path.is_file()
-                and not is_sensitive(
-                    path
-                )
-            ):
-
-                archive.write(
-                    path,
-                    relative,
-                )
-
-    return FileResponse(
-        archive_path,
-        filename=(
-            f"open-agent-"
-            f"{session_id}.zip"
-        ),
-        media_type=(
-            "application/zip"
-        ),
-    )
-
-
-# ============================================================
-# STARTUP CLEANUP
-# ============================================================
-
-@app.on_event(
-    "startup"
-)
-async def startup_cleanup():
-
-    cutoff = (
-        time.time()
-        - WORKSPACE_TIMEOUT
-    )
-
-    try:
-
-        for path in BASE_DIR.iterdir():
-
-            try:
-
-                if (
-                    path.is_dir()
-                    and path.stat()
-                    .st_mtime
-                    < cutoff
-                ):
-
-                    shutil.rmtree(
-                        path,
-                        ignore_errors=True,
-                    )
-
-            except OSError:
+            if not path.is_file():
                 continue
 
-    except OSError:
-        pass
+            if ".git" in path.parts:
+                continue
+
+            archive.write(
+                path,
+                path.relative_to(
+                    session.workspace
+                ),
+            )
+
+    return FileResponse(
+        output,
+        filename=f"open-agent-{session.id}.zip",
+        media_type="application/zip",
+    )
 
 
 # ============================================================
-# LOCAL SERVER
+# WORK PREPARE
+# ============================================================
+
+@app.post("/work/prepare")
+async def work_prepare(
+    request: WorkPrepareRequest,
+):
+
+    if not request.authorization:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Explicit Work Mode authorization "
+                "is required."
+            ),
+        )
+
+    # Existing plan session.
+    if request.session_id:
+
+        session = get_session(
+            request.session_id
+        )
+
+        if (
+            session.mode == "plan"
+            and not session.plan_finalized
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Plan must be finalized "
+                    "before Work Mode."
+                ),
+            )
+
+    else:
+
+        session = create_session(
+            mode="work"
+        )
+
+    session.mode = "work"
+    session.authorized = True
+    session.cancelled = False
+
+    # Clone repository if provided.
+    if request.repository_url:
+
+        workspace = (
+            WORKSPACE_ROOT
+            / session.id
+            / "repo"
+        )
+
+        clone_repo(
+            request.repository_url,
+            request.branch,
+            workspace,
+        )
+
+        session.workspace = workspace
+
+        session.repository = {
+            "url": request.repository_url,
+            "branch": request.branch,
+        }
+
+    elif not session.workspace:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Provide repository_url or use "
+                "an existing uploaded workspace."
+            ),
+        )
+
+    session.project = detect_project(
+        session.workspace
+    )
+
+    session.status = "prepared"
+
+    log_event(
+        session,
+        "work_authorized",
+        (
+            "User explicitly authorized "
+            "Work Mode."
+        ),
+    )
+
+    return {
+        "ok": True,
+        "session_id": session.id,
+        "mode": "work",
+        "authorized": True,
+        "status": session.status,
+        "repository": session.repository,
+        "project": session.project,
+        "tree": list_tree(
+            session.workspace
+        ),
+    }
+
+
+# ============================================================
+# WORK EXECUTE
+# ============================================================
+
+@app.post("/work/execute")
+async def work_execute(
+    request: WorkExecuteRequest,
+):
+
+    session = get_session(
+        request.session_id
+    )
+
+    if not session.authorized:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Work Mode is not authorized."
+            ),
+        )
+
+    if not session.workspace:
+        raise HTTPException(
+            status_code=400,
+            detail="No workspace.",
+        )
+
+    if session.status in {
+        "working",
+        "testing",
+        "fixing",
+    }:
+
+        return {
+            "ok": True,
+            "already_running": True,
+            "session_id": session.id,
+        }
+
+    task = (
+        request.task
+        or session.task
+        or session.plan
+    )
+
+    if not task:
+        raise HTTPException(
+            status_code=422,
+            detail="task is required.",
+        )
+
+    session.task = task
+    session.status = "queued"
+    session.cancelled = False
+
+    thread = threading.Thread(
+        target=autonomous_worker,
+        args=(session, task),
+        daemon=True,
+    )
+
+    thread.start()
+
+    return {
+        "ok": True,
+        "session_id": session.id,
+        "status": "queued",
+        "message": (
+            "Autonomous Work Mode started."
+        ),
+    }
+
+
+# ============================================================
+# WORK STOP
+# ============================================================
+
+@app.post("/work/stop")
+async def work_stop(
+    request: SessionRequest,
+):
+
+    session = get_session(
+        request.session_id
+    )
+
+    session.cancelled = True
+    session.status = "stopping"
+
+    log_event(
+        session,
+        "stop_requested",
+        "Stop requested by user.",
+    )
+
+    return {
+        "ok": True,
+        "session_id": session.id,
+        "status": "stopping",
+    }
+
+
+# ============================================================
+# WORK STATUS
+# ============================================================
+
+@app.get("/work/status/{session_id}")
+async def work_status(
+    session_id: str,
+):
+
+    session = get_session(
+        session_id
+    )
+
+    with session.lock:
+
+        return {
+            "ok": True,
+            "session_id": session.id,
+            "mode": session.mode,
+            "status": session.status,
+            "authorized": session.authorized,
+            "plan_finalized": session.plan_finalized,
+            "task": session.task,
+            "iterations": session.iterations,
+            "test_iterations": (
+                session.test_iterations
+            ),
+            "started_at": session.started_at,
+            "finished_at": session.finished_at,
+        }
+
+
+# ============================================================
+# WORK LOGS
+# ============================================================
+
+@app.get("/work/logs/{session_id}")
+async def work_logs(
+    session_id: str,
+):
+
+    session = get_session(
+        session_id
+    )
+
+    with session.lock:
+
+        return {
+            "ok": True,
+            "session_id": session.id,
+            "status": session.status,
+            "logs": list(session.logs),
+        }
+
+
+# ============================================================
+# COMMIT
+# ============================================================
+
+@app.post("/work/commit")
+async def work_commit(
+    request: CommitRequest,
+):
+
+    session = get_session(
+        request.session_id
+    )
+
+    if not session.authorized:
+        raise HTTPException(
+            status_code=403,
+            detail="Work authorization required.",
+        )
+
+    if not session.workspace:
+        raise HTTPException(
+            status_code=400,
+            detail="No workspace.",
+        )
+
+    message = (
+        request.message
+        or "Open Agent: implement requested changes"
+    )
+
+    result = git_commit(
+        session.workspace,
+        message,
+    )
+
+    log_event(
+        session,
+        "commit",
+        (
+            "Commit successful."
+            if result.get("ok")
+            else "Commit failed."
+        ),
+        {
+            "ok": result.get("ok"),
+            "stdout": result.get(
+                "stdout",
+                "",
+            )[-10000:],
+            "stderr": result.get(
+                "stderr",
+                "",
+            )[-10000:],
+        },
+    )
+
+    return {
+        "ok": result.get("ok"),
+        "message": (
+            "Commit successful."
+            if result.get("ok")
+            else "Commit failed."
+        ),
+        "result": result,
+    }
+
+
+# ============================================================
+# PUSH
+# ============================================================
+
+@app.post("/work/push")
+async def work_push(
+    request: PushRequest,
+):
+
+    session = get_session(
+        request.session_id
+    )
+
+    if not session.authorized:
+        raise HTTPException(
+            status_code=403,
+            detail="Work authorization required.",
+        )
+
+    if not GITHUB_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "GitHub push capability is unavailable "
+                "because GITHUB_TOKEN is not configured."
+            ),
+        )
+
+    if not session.workspace:
+        raise HTTPException(
+            status_code=400,
+            detail="No workspace.",
+        )
+
+    result = git_push(
+        session.workspace,
+        request.branch,
+    )
+
+    log_event(
+        session,
+        "push",
+        (
+            "Push successful."
+            if result.get("ok")
+            else "Push failed."
+        ),
+        {
+            "ok": result.get("ok"),
+            "stdout": result.get(
+                "stdout",
+                "",
+            )[-10000:],
+            "stderr": result.get(
+                "stderr",
+                "",
+            )[-10000:],
+        },
+    )
+
+    return {
+        "ok": result.get("ok"),
+        "message": (
+            "Successfully pushed to GitHub."
+            if result.get("ok")
+            else "GitHub push failed."
+        ),
+        "result": result,
+    }
+
+
+# ============================================================
+# SIMPLE DOWNLOAD ENDPOINT
+# ============================================================
+
+@app.get("/download/{filename}")
+async def download_file(
+    filename: str,
+):
+
+    # Only allow files from EXPORT_ROOT.
+    candidate = (
+        EXPORT_ROOT
+        / filename
+    ).resolve()
+
+    try:
+        candidate.relative_to(
+            EXPORT_ROOT.resolve()
+        )
+    except ValueError:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid filename.",
+        )
+
+    if not candidate.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    return FileResponse(
+        candidate,
+        filename=candidate.name,
+    )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+async def health():
+
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "status": "online",
+
+        "ai": {
+            "provider": "Google Gemini",
+            "configured": bool(
+                GEMINI_API_KEY
+            ),
+            "model": GEMINI_MODEL,
+        },
+
+        "github": {
+            "configured": bool(
+                GITHUB_TOKEN
+            ),
+        },
+
+        "capabilities": CAPABILITIES,
+
+        "limits": {
+            "max_agent_iterations": (
+                MAX_AGENT_ITERATIONS
+            ),
+            "max_test_iterations": (
+                MAX_TEST_ITERATIONS
+            ),
+            "command_timeout": (
+                COMMAND_TIMEOUT
+            ),
+            "workspace_timeout": (
+                WORKSPACE_TIMEOUT
+            ),
+            "max_file_size": MAX_FILE_SIZE,
+        },
+
+        "modes": {
+            "chat": True,
+            "plan": True,
+            "work": True,
+        },
+    }
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+async def root():
+
+    return {
+        "name": APP_NAME,
+        "version": APP_VERSION,
+        "description": (
+            "Advanced autonomous AI "
+            "software engineering agent."
+        ),
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "health": "/health",
+        "modes": [
+            "chat",
+            "plan",
+            "work",
+        ],
+    }
+
+
+# ============================================================
+# GLOBAL ERROR HANDLER
+# ============================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(
+    request: Request,
+    exc: Exception,
+):
+
+    # Do not expose secrets or full environment.
+    return JSONResponse(
+        status_code=500,
+        content={
+            "ok": False,
+            "error": "Internal server error.",
+            "detail": str(exc),
+        },
+    )
+
+
+# ============================================================
+# LOCAL ENTRYPOINT
 # ============================================================
 
 if __name__ == "__main__":
 
     import uvicorn
 
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000",
+        )
+    )
+
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                "8000",
-            )
-        ),
+        port=port,
         reload=False,
-    )
+        )
