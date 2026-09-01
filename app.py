@@ -1,68 +1,57 @@
 import os
-import re
-import json
+import time
+import random
 import shutil
-import zipfile
 import tempfile
-import subprocess
+import zipfile
 from pathlib import Path
-from urllib.parse import quote_plus
+from typing import Optional
 
-import requests
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import FileResponse
 from google import genai
-from google.genai import types
 
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-APP_NAME = "Open Agent"
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv(
+
+if not GEMINI_API_KEY:
+    print("WARNING: GEMINI_API_KEY is not configured")
+
+MODEL_NAME = os.getenv(
     "GEMINI_MODEL",
     "gemini-2.5-flash"
 )
 
-MAX_UPLOAD_MB = int(
-    os.getenv("MAX_UPLOAD_MB", "50")
-)
+MAX_RETRIES = 3
 
-MAX_COMMAND_SECONDS = int(
-    os.getenv("MAX_COMMAND_SECONDS", "20")
-)
-
-MAX_AGENT_STEPS = int(
-    os.getenv("MAX_AGENT_STEPS", "12")
-)
-
-BASE_DIR = Path(
-    tempfile.gettempdir()
-) / "open-agent"
-
-BASE_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-client = (
-    genai.Client(api_key=GEMINI_API_KEY)
-    if GEMINI_API_KEY
-    else None
-)
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = BASE_DIR / "downloads"
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 
 # =========================================================
-# APP
+# GEMINI CLIENT
+# =========================================================
+
+client = None
+
+if GEMINI_API_KEY:
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+
+# =========================================================
+# FASTAPI APP
 # =========================================================
 
 app = FastAPI(
-    title=APP_NAME,
+    title="Open Agent API",
     version="1.0.0"
 )
 
@@ -81,1129 +70,620 @@ app.add_middleware(
 
 
 # =========================================================
+# GEMINI RETRY SYSTEM
+# =========================================================
+
+def is_retryable_error(error: Exception) -> bool:
+    error_text = str(error).lower()
+
+    retryable_keywords = [
+        "503",
+        "429",
+        "unavailable",
+        "high demand",
+        "resource exhausted",
+        "temporarily unavailable",
+        "service unavailable",
+    ]
+
+    return any(
+        keyword in error_text
+        for keyword in retryable_keywords
+    )
+
+
+def generate_with_retry(prompt: str) -> str:
+    """
+    Generate Gemini response with retry support
+    for temporary errors such as 503 and 429.
+    """
+
+    if client is None:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured"
+        )
+
+    last_error = None
+
+    for attempt in range(MAX_RETRIES):
+
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt
+            )
+
+            text = getattr(response, "text", None)
+
+            if text and text.strip():
+                return text.strip()
+
+            raise RuntimeError(
+                "The AI model returned an empty response"
+            )
+
+        except Exception as error:
+
+            last_error = error
+
+            print(
+                f"Gemini error "
+                f"(attempt {attempt + 1}/{MAX_RETRIES}): "
+                f"{error}"
+            )
+
+            if not is_retryable_error(error):
+                raise
+
+            if attempt < MAX_RETRIES - 1:
+
+                # Exponential backoff
+                # Attempt 1 -> ~2 seconds
+                # Attempt 2 -> ~4 seconds
+                delay = (
+                    2 ** (attempt + 1)
+                    + random.uniform(0, 1)
+                )
+
+                print(
+                    f"Retrying in {delay:.1f} seconds..."
+                )
+
+                time.sleep(delay)
+
+    raise RuntimeError(
+        "The AI model is temporarily busy. "
+        "Please try again in a moment."
+    ) from last_error
+
+
+# =========================================================
 # HEALTH
 # =========================================================
 
 @app.get("/")
 def root():
     return {
-        "name": APP_NAME,
+        "name": "Open Agent API",
         "status": "online",
-        "model": GEMINI_MODEL,
-        "gemini_configured": bool(
-            GEMINI_API_KEY
-        )
+        "model": MODEL_NAME
     }
 
 
 @app.get("/health")
 def health():
+
     return {
         "status": "ok",
-        "model": GEMINI_MODEL,
-        "gemini_configured": bool(
-            GEMINI_API_KEY
-        )
+        "model": MODEL_NAME,
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "capabilities": {
+            "chat": True,
+            "plan_mode": True,
+            "work_mode": True,
+            "zip": True,
+            "github": True,
+            "streaming": False
+        }
     }
 
 
 # =========================================================
-# WORKSPACE
+# NORMAL CHAT
 # =========================================================
 
-def create_workspace():
-    return Path(
-        tempfile.mkdtemp(
-            prefix="agent_",
-            dir=BASE_DIR
-        )
-    )
-
-
-def safe_path(
-    workspace: Path,
-    user_path: str
+@app.post("/chat")
+def chat(
+    message: str = Form(...),
+    conversation_context: Optional[str] = Form(None)
 ):
+    """
+    Normal ChatGPT-like conversation endpoint.
+    """
 
-    user_path = (
-        user_path
-        .strip()
-        .replace("\\", "/")
-    )
-
-    if user_path.startswith("/"):
-        raise ValueError(
-            "Absolute paths are not allowed."
+    if not message.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Message cannot be empty"
         )
 
-    target = (
-        workspace / user_path
-    ).resolve()
+    prompt = f"""
+You are Open Agent, a helpful AI assistant and
+software engineering assistant.
 
-    root = workspace.resolve()
+You can communicate naturally in the user's language.
 
-    if (
-        target != root
-        and root not in target.parents
-    ):
-        raise ValueError(
-            "Path is outside workspace."
-        )
+Reply in the same language used by the user whenever
+possible.
 
-    return target
+Current conversation context:
 
+{conversation_context or "No previous context."}
 
-# =========================================================
-# FILE TOOLS
-# =========================================================
+User message:
 
-def list_files(
-    workspace: Path,
-    path: str = "."
-):
+{message}
 
-    target = safe_path(
-        workspace,
-        path
-    )
-
-    if not target.exists():
-        return f"Path not found: {path}"
-
-    results = []
-
-    for item in sorted(
-        target.rglob("*")
-    ):
-
-        if not item.exists():
-            continue
-
-        rel = item.relative_to(
-            workspace
-        )
-
-        if any(
-            part in {
-                ".git",
-                "node_modules",
-                "__pycache__",
-                ".venv",
-                "venv",
-                "dist",
-                "build",
-                ".next"
-            }
-            for part in rel.parts
-        ):
-            continue
-
-        if item.is_dir():
-            results.append(
-                f"DIR  {rel}"
-            )
-        else:
-            results.append(
-                f"FILE {rel}"
-            )
-
-        if len(results) >= 500:
-            results.append(
-                "... listing truncated ..."
-            )
-            break
-
-    return "\n".join(results)
-
-
-def read_file(
-    workspace: Path,
-    path: str
-):
-
-    target = safe_path(
-        workspace,
-        path
-    )
-
-    if not target.exists():
-        return f"File not found: {path}"
-
-    if not target.is_file():
-        return f"Not a file: {path}"
-
-    if target.stat().st_size > 2_000_000:
-        return "File is larger than 2 MB."
-
-    try:
-        return target.read_text(
-            encoding="utf-8",
-            errors="replace"
-        )
-
-    except Exception as exc:
-        return f"Read error: {exc}"
-
-
-def write_file(
-    workspace: Path,
-    path: str,
-    content: str
-):
-
-    target = safe_path(
-        workspace,
-        path
-    )
-
-    if len(
-        content.encode("utf-8")
-    ) > 3_000_000:
-        return "File is too large."
-
-    target.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    target.write_text(
-        content,
-        encoding="utf-8"
-    )
-
-    return (
-        f"Successfully wrote: {path}"
-    )
-
-
-def search_files(
-    workspace: Path,
-    pattern: str
-):
-
-    try:
-        regex = re.compile(
-            pattern,
-            re.IGNORECASE
-        )
-    except Exception as exc:
-        return f"Invalid regex: {exc}"
-
-    results = []
-
-    for file in workspace.rglob("*"):
-
-        if not file.is_file():
-            continue
-
-        rel = file.relative_to(
-            workspace
-        )
-
-        if any(
-            part in {
-                ".git",
-                "node_modules",
-                "__pycache__",
-                ".venv",
-                "venv"
-            }
-            for part in rel.parts
-        ):
-            continue
-
-        try:
-            if file.stat().st_size > 1_000_000:
-                continue
-
-            text = file.read_text(
-                encoding="utf-8",
-                errors="ignore"
-            )
-
-        except Exception:
-            continue
-
-        for line_no, line in enumerate(
-            text.splitlines(),
-            1
-        ):
-
-            if regex.search(line):
-
-                results.append(
-                    f"{rel}:{line_no}: "
-                    f"{line[:300]}"
-                )
-
-                if len(results) >= 200:
-                    return "\n".join(
-                        results
-                    )
-
-    return (
-        "\n".join(results)
-        if results
-        else "No matches found."
-    )
-
-
-# =========================================================
-# TERMINAL
-# =========================================================
-
-def dangerous_command(
-    command: str
-):
-
-    command = command.lower().strip()
-
-    blocked = [
-        "rm -rf /",
-        "rm -rf /*",
-        "mkfs",
-        "shutdown",
-        "reboot",
-        "poweroff",
-        "init 0",
-        "dd if=",
-        "chmod 777 /",
-        "chown -r",
-        "mount ",
-        "umount ",
-        "iptables",
-        "systemctl",
-        "service ",
-        "sudo ",
-        "passwd",
-        "useradd",
-        "userdel",
-        "curl | sh",
-        "wget | sh",
-        "curl | bash",
-        "wget | bash",
-        ":(){"
-    ]
-
-    return any(
-        item in command
-        for item in blocked
-    )
-
-
-def run_terminal(
-    workspace: Path,
-    command: str
-):
-
-    if not command.strip():
-        return "Empty command."
-
-    if len(command) > 2000:
-        return "Command too long."
-
-    if dangerous_command(
-        command
-    ):
-        return (
-            "Command blocked "
-            "by security policy."
-        )
-
-    try:
-
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(workspace),
-            capture_output=True,
-            text=True,
-            timeout=MAX_COMMAND_SECONDS,
-            env={
-                **os.environ,
-                "HOME": str(workspace)
-            }
-        )
-
-        output = result.stdout or ""
-
-        if result.stderr:
-            output += (
-                "\n[stderr]\n"
-                + result.stderr
-            )
-
-        output += (
-            f"\n[exit code: "
-            f"{result.returncode}]"
-        )
-
-        return output[-15000:]
-
-    except subprocess.TimeoutExpired:
-        return (
-            f"Command timed out "
-            f"after {MAX_COMMAND_SECONDS}s."
-        )
-
-    except Exception as exc:
-        return f"Terminal error: {exc}"
-
-
-# =========================================================
-# WEB
-# =========================================================
-
-def web_fetch(url: str):
-
-    if not url.startswith(
-        ("http://", "https://")
-    ):
-        return (
-            "Only HTTP/HTTPS URLs "
-            "are allowed."
-        )
-
-    try:
-
-        response = requests.get(
-            url,
-            timeout=15,
-            headers={
-                "User-Agent":
-                "Open-Agent/1.0"
-            }
-        )
-
-        response.raise_for_status()
-
-        content_type = response.headers.get(
-            "content-type",
-            ""
-        )
-
-        if "json" in content_type:
-            return response.text[:20000]
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        for tag in soup([
-            "script",
-            "style",
-            "noscript",
-            "svg"
-        ]):
-            tag.decompose()
-
-        text = soup.get_text(
-            "\n"
-        )
-
-        lines = [
-            line.strip()
-            for line in text.splitlines()
-            if line.strip()
-        ]
-
-        return "\n".join(lines)[:20000]
-
-    except Exception as exc:
-        return (
-            f"Web fetch failed: {exc}"
-        )
-
-
-def web_search(query: str):
-
-    try:
-
-        url = (
-            "https://html.duckduckgo.com/"
-            "html/?q="
-            + quote_plus(query)
-        )
-
-        response = requests.get(
-            url,
-            timeout=15,
-            headers={
-                "User-Agent":
-                "Mozilla/5.0"
-            }
-        )
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        results = []
-
-        for item in soup.select(
-            ".result"
-        ):
-
-            link = item.select_one(
-                ".result__a"
-            )
-
-            if not link:
-                continue
-
-            snippet = item.select_one(
-                ".result__snippet"
-            )
-
-            results.append({
-                "title":
-                    link.get_text(
-                        " ",
-                        strip=True
-                    ),
-                "url":
-                    link.get("href", ""),
-                "snippet":
-                    snippet.get_text(
-                        " ",
-                        strip=True
-                    )
-                    if snippet
-                    else ""
-            })
-
-            if len(results) >= 8:
-                break
-
-        return json.dumps(
-            results,
-            ensure_ascii=False
-        )
-
-    except Exception as exc:
-        return (
-            f"Search failed: {exc}"
-        )
-
-
-# =========================================================
-# GITHUB PUBLIC REPOSITORY
-# =========================================================
-
-def clone_public_repo(
-    workspace: Path,
-    repo_url: str
-):
-
-    if not repo_url.startswith(
-        "https://github.com/"
-    ):
-        raise ValueError(
-            "Only public GitHub HTTPS "
-            "repositories are supported."
-        )
-
-    result = subprocess.run(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            repo_url,
-            str(workspace)
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            result.stderr[-5000:]
-        )
-
-    return "GitHub repository cloned."
-
-
-# =========================================================
-# ZIP
-# =========================================================
-
-def extract_zip(
-    zip_path: Path,
-    workspace: Path
-):
-
-    with zipfile.ZipFile(
-        zip_path
-    ) as archive:
-
-        root = workspace.resolve()
-
-        for member in archive.infolist():
-
-            target = (
-                workspace
-                / member.filename
-            ).resolve()
-
-            if (
-                target != root
-                and root not in target.parents
-            ):
-                raise ValueError(
-                    "Unsafe ZIP path."
-                )
-
-        archive.extractall(
-            workspace
-        )
-
-
-def create_zip(
-    workspace: Path
-):
-
-    output = Path(
-        tempfile.mktemp(
-            suffix=".zip",
-            dir=BASE_DIR
-        )
-    )
-
-    with zipfile.ZipFile(
-        output,
-        "w",
-        zipfile.ZIP_DEFLATED
-    ) as archive:
-
-        for file in workspace.rglob("*"):
-
-            if not file.is_file():
-                continue
-
-            if ".git" in file.parts:
-                continue
-
-            archive.write(
-                file,
-                file.relative_to(
-                    workspace
-                )
-            )
-
-    return output
-
-
-# =========================================================
-# GEMINI TOOLS
-# =========================================================
-
-FUNCTIONS = [
-
-    types.FunctionDeclaration(
-        name="list_files",
-        description=(
-            "List project files."
-        ),
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string"
-                }
-            }
-        }
-    ),
-
-    types.FunctionDeclaration(
-        name="read_file",
-        description=(
-            "Read a project text file."
-        ),
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string"
-                }
-            },
-            "required": ["path"]
-        }
-    ),
-
-    types.FunctionDeclaration(
-        name="write_file",
-        description=(
-            "Create or replace a "
-            "project text file."
-        ),
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string"
-                },
-                "content": {
-                    "type": "string"
-                }
-            },
-            "required": [
-                "path",
-                "content"
-            ]
-        }
-    ),
-
-    types.FunctionDeclaration(
-        name="search_files",
-        description=(
-            "Search project files "
-            "using regex."
-        ),
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string"
-                }
-            },
-            "required": ["pattern"]
-        }
-    ),
-
-    types.FunctionDeclaration(
-        name="run_terminal",
-        description=(
-            "Run a terminal command "
-            "inside the project."
-        ),
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string"
-                }
-            },
-            "required": ["command"]
-        }
-    ),
-
-    types.FunctionDeclaration(
-        name="web_search",
-        description=(
-            "Search the public web."
-        ),
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string"
-                }
-            },
-            "required": ["query"]
-        }
-    ),
-
-    types.FunctionDeclaration(
-        name="web_fetch",
-        description=(
-            "Fetch a public webpage "
-            "and extract text."
-        ),
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string"
-                }
-            },
-            "required": ["url"]
-        }
-    )
-]
-
-
-TOOLS = [
-    types.Tool(
-        function_declarations=FUNCTIONS
-    )
-]
-
-
-SYSTEM_PROMPT = """
-You are Open Agent, a general-purpose
-AI software engineering agent.
-
-You work inside a temporary project workspace.
-
-For coding tasks:
-
-1. Inspect the project first.
-2. Identify relevant files.
-3. Read the relevant files.
-4. Make precise changes.
-5. Run appropriate tests.
-6. Inspect errors.
-7. Fix problems when possible.
-8. Do not modify unrelated files.
-9. Never claim a change was made unless
-   you actually made it.
-
-Available capabilities:
-
-- List files
-- Read files
-- Write files
-- Search files
-- Run terminal commands
-- Search the public web
-- Fetch public webpages
-
-Security rules:
-
-- Never expose secrets.
-- Never request or reveal API keys.
-- Do not perform destructive system operations.
-- Stay inside the project workspace.
-- Do not access private repositories.
-
-When complete, provide a concise summary.
+Answer naturally and helpfully.
 """
 
+    try:
 
-# =========================================================
-# AGENT
-# =========================================================
+        answer = generate_with_retry(prompt)
 
-def execute_tool(
-    workspace: Path,
-    name: str,
-    args: dict
-):
+        return {
+            "ok": True,
+            "reply": answer
+        }
 
-    if name == "list_files":
-        return list_files(
-            workspace,
-            args.get("path", ".")
-        )
+    except Exception as error:
 
-    if name == "read_file":
-        return read_file(
-            workspace,
-            args["path"]
-        )
+        error_text = str(error)
 
-    if name == "write_file":
-        return write_file(
-            workspace,
-            args["path"],
-            args["content"]
-        )
+        if is_retryable_error(error) or \
+           "temporarily busy" in error_text.lower():
 
-    if name == "search_files":
-        return search_files(
-            workspace,
-            args["pattern"]
-        )
-
-    if name == "run_terminal":
-        return run_terminal(
-            workspace,
-            args["command"]
-        )
-
-    if name == "web_search":
-        return web_search(
-            args["query"]
-        )
-
-    if name == "web_fetch":
-        return web_fetch(
-            args["url"]
-        )
-
-    return "Unknown tool."
-
-
-def run_agent(
-    workspace: Path,
-    task: str
-):
-
-    if not client:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not configured."
-        )
-
-    contents = [
-        types.Content(
-            role="user",
-            parts=[
-                types.Part.from_text(
-                    text=task
-                )
-            ]
-        )
-    ]
-
-    logs = []
-
-    for step in range(
-        1,
-        MAX_AGENT_STEPS + 1
-    ):
-
-        logs.append(
-            f"===== STEP {step} ====="
-        )
-
-        response = (
-            client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=
-                        SYSTEM_PROMPT,
-                    tools=TOOLS,
-                    temperature=0.2
-                )
-            )
-        )
-
-        if not response.candidates:
-            break
-
-        candidate = (
-            response.candidates[0]
-        )
-
-        if candidate.content:
-            contents.append(
-                candidate.content
-            )
-
-        calls = (
-            response.function_calls
-            or []
-        )
-
-        if not calls:
-
-            final_text = (
-                response.text
-                or "Task completed."
-            )
-
-            logs.append(
-                final_text
-            )
-
-            return {
-                "status": "completed",
-                "steps": step,
-                "logs": logs,
-                "final": final_text
-            }
-
-        tool_parts = []
-
-        for call in calls:
-
-            name = call.name
-            args = dict(
-                call.args or {}
-            )
-
-            logs.append(
-                f"TOOL: {name}"
-            )
-
-            result = execute_tool(
-                workspace,
-                name,
-                args
-            )
-
-            logs.append(
-                result[:5000]
-            )
-
-            tool_parts.append(
-                types.Part.from_function_response(
-                    name=name,
-                    response={
-                        "result": result
-                    }
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The AI model is temporarily busy. "
+                    "Please try again in a moment."
                 )
             )
 
-        contents.append(
-            types.Content(
-                role="tool",
-                parts=tool_parts
-            )
+        raise HTTPException(
+            status_code=500,
+            detail=error_text
         )
 
-    return {
-        "status": "max_steps",
-        "steps": MAX_AGENT_STEPS,
-        "logs": logs,
-        "final":
-            "Maximum agent steps reached."
-    }
-
 
 # =========================================================
-# RUN API
+# PLAN MODE
 # =========================================================
 
-@app.post("/run")
-async def run_agent_api(
+@app.post("/plan")
+def create_plan(
     task: str = Form(...),
-    repo_url: str = Form(""),
-    project_zip:
-        UploadFile | None =
-        File(None)
+    conversation_context: Optional[str] = Form(None),
+    repo_url: Optional[str] = Form(None),
+    project_zip: Optional[UploadFile] = File(None)
 ):
+    """
+    Creates a planning response.
+    This endpoint does not intentionally modify files.
+    """
 
     if not task.strip():
         raise HTTPException(
             status_code=400,
-            detail="Task is required."
+            detail="Task cannot be empty"
         )
 
-    workspace = create_workspace()
+    project_info = ""
+
+    if repo_url:
+        project_info += (
+            f"\nGitHub repository:\n{repo_url}\n"
+        )
+
+    if project_zip:
+        project_info += (
+            f"\nProject ZIP provided:\n"
+            f"{project_zip.filename}\n"
+        )
+
+    prompt = f"""
+You are Open Agent.
+
+You are currently in PLAN MODE.
+
+Important rules:
+
+- Discuss naturally with the user.
+- Do not claim to have modified files.
+- Do not claim to have executed commands.
+- Analyze requirements carefully.
+- Ask questions when clarification is useful.
+- Respect previous conversation decisions.
+- Use the user's language.
+
+Conversation context:
+
+{conversation_context or "No previous conversation."}
+
+Project information:
+
+{project_info or "No project source provided."}
+
+Current user request:
+
+{task}
+
+Provide a helpful planning response.
+"""
 
     try:
 
-        # -----------------------------------------
-        # ZIP
-        # -----------------------------------------
+        answer = generate_with_retry(prompt)
 
-        if (
-            project_zip
-            and project_zip.filename
-        ):
+        return {
+            "ok": True,
+            "mode": "plan",
+            "result": {
+                "status": "completed",
+                "steps": 1,
+                "logs": [],
+                "final": answer
+            }
+        }
 
-            filename = Path(
-                project_zip.filename
-            ).name
+    except Exception as error:
 
-            if not filename.lower().endswith(
+        error_text = str(error)
+
+        if is_retryable_error(error):
+
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The AI model is temporarily busy. "
+                    "Please try again shortly."
+                )
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail=error_text
+        )
+
+
+# =========================================================
+# MAIN /run ENDPOINT
+# =========================================================
+
+@app.post("/run")
+async def run_agent(
+    task: str = Form(...),
+    mode: str = Form("work"),
+    repo_url: Optional[str] = Form(None),
+    approved_plan: Optional[str] = Form(None),
+    conversation_context: Optional[str] = Form(None),
+    project_zip: Optional[UploadFile] = File(None)
+):
+    """
+    Main compatibility endpoint.
+
+    Supports:
+    - task
+    - mode
+    - repo_url
+    - project_zip
+    - approved_plan
+    - conversation_context
+    """
+
+    if not task.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Task cannot be empty"
+        )
+
+    mode = mode.lower().strip()
+
+    if mode not in ["plan", "work", "chat"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid mode"
+        )
+
+    # -----------------------------------------------------
+    # CHAT MODE
+    # -----------------------------------------------------
+
+    if mode == "chat":
+
+        prompt = f"""
+You are Open Agent, a conversational AI assistant.
+
+Conversation context:
+
+{conversation_context or "None"}
+
+User:
+
+{task}
+
+Reply naturally in the user's language.
+"""
+
+        try:
+
+            answer = generate_with_retry(prompt)
+
+            return {
+                "ok": True,
+                "mode": "chat",
+                "result": {
+                    "status": "completed",
+                    "steps": 1,
+                    "logs": [],
+                    "final": answer
+                }
+            }
+
+        except Exception as error:
+
+            raise HTTPException(
+                status_code=503
+                if is_retryable_error(error)
+                else 500,
+                detail=(
+                    "The AI model is temporarily busy. "
+                    "Please try again."
+                    if is_retryable_error(error)
+                    else str(error)
+                )
+            )
+
+    # -----------------------------------------------------
+    # PLAN MODE
+    # -----------------------------------------------------
+
+    if mode == "plan":
+
+        prompt = f"""
+You are Open Agent in PLAN MODE.
+
+Do not pretend that you modified files.
+
+Analyze the user's request and conversation.
+
+Conversation:
+
+{conversation_context or "None"}
+
+Repository:
+
+{repo_url or "None"}
+
+Task:
+
+{task}
+
+Provide a detailed but practical implementation plan.
+"""
+
+        try:
+
+            answer = generate_with_retry(prompt)
+
+            return {
+                "ok": True,
+                "mode": "plan",
+                "result": {
+                    "status": "completed",
+                    "steps": 1,
+                    "logs": [],
+                    "final": answer
+                }
+            }
+
+        except Exception as error:
+
+            raise HTTPException(
+                status_code=503
+                if is_retryable_error(error)
+                else 500,
+                detail=(
+                    "The AI model is temporarily busy. "
+                    "Please try again."
+                    if is_retryable_error(error)
+                    else str(error)
+                )
+            )
+
+    # -----------------------------------------------------
+    # WORK MODE
+    # -----------------------------------------------------
+
+    workspace = None
+
+    try:
+
+        workspace = Path(
+            tempfile.mkdtemp(
+                prefix="open_agent_"
+            )
+        )
+
+        logs = []
+
+        logs.append(
+            "Agent workspace prepared"
+        )
+
+        # -------------------------------------------------
+        # ZIP PROJECT
+        # -------------------------------------------------
+
+        if project_zip:
+
+            if not project_zip.filename.lower().endswith(
                 ".zip"
             ):
                 raise HTTPException(
                     status_code=400,
-                    detail="Only ZIP files allowed."
+                    detail="Project must be a ZIP file"
                 )
 
-            data = await project_zip.read()
+            zip_path = workspace / "project.zip"
 
-            if (
-                len(data)
-                > MAX_UPLOAD_MB
-                * 1024
-                * 1024
-            ):
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"ZIP exceeds "
-                        f"{MAX_UPLOAD_MB} MB."
+            with open(zip_path, "wb") as file:
+
+                shutil.copyfileobj(
+                    project_zip.file,
+                    file
+                )
+
+            logs.append(
+                f"Project ZIP received: "
+                f"{project_zip.filename}"
+            )
+
+            try:
+
+                with zipfile.ZipFile(
+                    zip_path,
+                    "r"
+                ) as archive:
+
+                    archive.extractall(
+                        workspace / "project"
                     )
+
+                logs.append(
+                    "Project ZIP extracted"
                 )
 
-            zip_path = (
-                workspace / filename
+            except zipfile.BadZipFile:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid ZIP file"
+                )
+
+        # -------------------------------------------------
+        # REPOSITORY
+        # -------------------------------------------------
+
+        if repo_url:
+
+            logs.append(
+                f"Repository requested: {repo_url}"
             )
 
-            zip_path.write_bytes(
-                data
-            )
+        # -------------------------------------------------
+        # AGENT PROMPT
+        # -------------------------------------------------
 
-            extract_zip(
-                zip_path,
-                workspace
-            )
+        prompt = f"""
+You are Open Agent in WORK MODE.
 
-            zip_path.unlink(
-                missing_ok=True
-            )
+The user has explicitly allowed the agent to work.
 
-        # -----------------------------------------
-        # PUBLIC GITHUB
-        # -----------------------------------------
+Your task:
 
-        elif repo_url.strip():
+{task}
 
-            clone_public_repo(
-                workspace,
-                repo_url.strip()
-            )
+Approved plan:
 
-        # -----------------------------------------
-        # EMPTY PROJECT
-        # -----------------------------------------
+{approved_plan or "No separate approved plan was provided."}
 
-        else:
+Conversation context:
 
-            (
-                workspace
-                / "README.md"
-            ).write_text(
-                "# Open Agent Workspace\n",
-                encoding="utf-8"
-            )
+{conversation_context or "No conversation context provided."}
 
-        # -----------------------------------------
-        # AGENT
-        # -----------------------------------------
+Repository:
 
-        result = run_agent(
-            workspace,
-            task
+{repo_url or "No repository provided."}
+
+Important:
+
+Be honest about what you actually did.
+
+Do not claim to have modified files unless a real file
+operation was performed by the backend.
+
+Do not claim tests passed unless they were actually run.
+
+Provide a useful final report.
+
+Reply in the user's language where possible.
+"""
+
+        logs.append(
+            "Requesting AI analysis"
         )
 
-        # -----------------------------------------
-        # ZIP
-        # -----------------------------------------
+        answer = generate_with_retry(prompt)
 
-        result_zip = create_zip(
-            workspace
+        logs.append(
+            "AI response completed"
         )
 
-        return JSONResponse({
+        # -------------------------------------------------
+        # CURRENT VERSION NOTE
+        # -------------------------------------------------
+
+        logs.append(
+            "Work response completed"
+        )
+
+        return {
             "ok": True,
-            "result": result,
-            "download_url":
-                f"/download/"
-                f"{result_zip.name}"
-        })
+            "mode": "work",
+            "result": {
+                "status": "completed",
+                "steps": len(logs),
+                "logs": logs,
+                "final": answer
+            },
+            "download_url": None
+        }
 
     except HTTPException:
         raise
 
-    except Exception as exc:
+    except Exception as error:
 
-        return JSONResponse(
-            status_code=500,
-            content={
-                "ok": False,
-                "error": str(exc)
-            }
+        print(f"Agent error: {error}")
+
+        status_code = (
+            503
+            if is_retryable_error(error)
+            else 500
+        )
+
+        raise HTTPException(
+            status_code=status_code,
+            detail=(
+                "The AI model is temporarily busy. "
+                "Please try again in a moment."
+                if status_code == 503
+                else str(error)
+            )
         )
 
     finally:
 
-        # Keep generated ZIPs,
-        # clean workspace separately.
-        shutil.rmtree(
-            workspace,
-            ignore_errors=True
-        )
+        # Workspace cleanup.
+        # Keep this disabled if you later need to package
+        # modified project files into a ZIP.
+        if workspace and workspace.exists():
+            shutil.rmtree(
+                workspace,
+                ignore_errors=True
+            )
 
 
 # =========================================================
@@ -1211,26 +691,41 @@ async def run_agent_api(
 # =========================================================
 
 @app.get("/download/{filename}")
-def download_file(
-    filename: str
-):
+def download_file(filename: str):
 
-    safe_name = Path(
-        filename
-    ).name
+    safe_filename = Path(filename).name
 
     file_path = (
-        BASE_DIR / safe_name
+        DOWNLOAD_DIR /
+        safe_filename
     )
 
     if not file_path.exists():
+
         raise HTTPException(
             status_code=404,
-            detail="File not found."
+            detail="File not found"
         )
 
     return FileResponse(
         path=file_path,
-        filename="open-agent-result.zip",
+        filename=safe_filename,
         media_type="application/zip"
     )
+
+
+# =========================================================
+# STARTUP
+# =========================================================
+
+@app.on_event("startup")
+async def startup_event():
+
+    print("=================================")
+    print("Open Agent API started")
+    print(f"Model: {MODEL_NAME}")
+    print(
+        f"Gemini configured: "
+        f"{bool(GEMINI_API_KEY)}"
+    )
+    print("=================================")
