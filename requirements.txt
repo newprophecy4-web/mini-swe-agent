@@ -1,0 +1,4 @@
+mini-swe-agent
+fastapi
+uvicorn
+python-multipart
