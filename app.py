@@ -1,131 +1,160 @@
 import os
 import subprocess
 import tempfile
+from html import escape
+
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
-HTML = """
+
+def page(result=""):
+    return f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mini SWE Agent</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 700px;
-            margin: auto;
-            padding: 20px;
-            background: #f5f5f5;
-        }
-        .box {
-            background: white;
-            padding: 20px;
-            border-radius: 14px;
-            box-shadow: 0 2px 10px #ddd;
-        }
-        input, textarea, button {
-            width: 100%;
-            box-sizing: border-box;
-            margin-top: 10px;
-            padding: 12px;
-            border-radius: 8px;
-            border: 1px solid #ccc;
-        }
-        textarea {
-            height: 150px;
-        }
-        button {
-            background: #111;
-            color: white;
-            border: none;
-            cursor: pointer;
-        }
-        pre {
-            white-space: pre-wrap;
-            background: #111;
-            color: #eee;
-            padding: 15px;
-            border-radius: 10px;
-            overflow-x: auto;
-        }
-    </style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini SWE Agent</title>
+
+<style>
+body {{
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #f3f4f6;
+}}
+
+.container {{
+    max-width: 700px;
+    margin: auto;
+    padding: 20px;
+}}
+
+.card {{
+    background: white;
+    padding: 20px;
+    border-radius: 16px;
+    box-shadow: 0 4px 20px rgba(0,0,0,.08);
+}}
+
+h1 {{
+    margin-top: 0;
+}}
+
+input, textarea, button {{
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 10px;
+    padding: 13px;
+    border-radius: 10px;
+    border: 1px solid #ddd;
+    font-size: 16px;
+}}
+
+textarea {{
+    min-height: 150px;
+    resize: vertical;
+}}
+
+button {{
+    background: #111;
+    color: white;
+    border: none;
+    font-weight: bold;
+}}
+
+pre {{
+    margin-top: 20px;
+    background: #111;
+    color: #eee;
+    padding: 15px;
+    border-radius: 10px;
+    white-space: pre-wrap;
+    overflow-x: auto;
+}}
+</style>
 </head>
+
 <body>
-<div class="box">
-    <h2>🤖 Mini SWE Agent</h2>
+<div class="container">
+<div class="card">
 
-    <form method="post">
-        <label>GitHub Repository URL</label>
-        <input
-            name="repo"
-            placeholder="https://github.com/user/project"
-            required
-        >
+<h1>🤖 Mini SWE Agent</h1>
 
-        <label>Task</label>
-        <textarea
-            name="task"
-            placeholder="Fix the mobile responsive problems..."
-            required
-        ></textarea>
+<form method="post">
 
-        <button type="submit">🚀 Run Agent</button>
-    </form>
+<label>Public GitHub Repository</label>
 
-    {result}
+<input
+name="repo"
+placeholder="https://github.com/user/project"
+required
+>
+
+<label>Task</label>
+
+<textarea
+name="task"
+placeholder="Fix the mobile responsive problems..."
+required
+></textarea>
+
+<button type="submit">🚀 Run Agent</button>
+
+</form>
+
+{result}
+
+</div>
 </div>
 </body>
 </html>
 """
 
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return HTMLResponse(HTML.format(result=""))
+    return page()
+
 
 @app.post("/", response_class=HTMLResponse)
-def run_agent(repo: str = Form(...), task: str = Form(...)):
+def run_agent(
+    repo: str = Form(...),
+    task: str = Form(...)
+):
 
-    token = os.getenv("GITHUB_TOKEN")
-
-    if not token:
-        return HTMLResponse(
-            HTML.format(
-                result="<p>❌ GITHUB_TOKEN is not configured.</p>"
-            )
+    if not repo.startswith("https://github.com/"):
+        return page(
+            "<pre>❌ Please enter a valid public GitHub repository URL.</pre>"
         )
 
     workdir = tempfile.mkdtemp()
 
-    if repo.startswith("https://github.com/"):
-        clone_url = repo.replace(
-            "https://github.com/",
-            f"https://x-access-token:{token}@github.com/"
-        )
-    else:
-        return HTMLResponse(
-            HTML.format(
-                result="<p>❌ Invalid GitHub repository URL.</p>"
-            )
+    try:
+
+        # Clone public repository
+        clone = subprocess.run(
+            ["git", "clone", repo, workdir],
+            capture_output=True,
+            text=True,
+            timeout=120
         )
 
-    try:
-        subprocess.run(
-            ["git", "clone", clone_url, workdir],
-            check=True,
-            capture_output=True,
-            text=True
-        )
+        if clone.returncode != 0:
+            return page(
+                f"<pre>{escape(clone.stderr)}</pre>"
+            )
+
+        # Run mini-SWE-agent
+        command = [
+            "mini",
+            "--model",
+            "gemini/gemini-2.5-flash",
+            task
+        ]
 
         result = subprocess.run(
-            [
-                "mini",
-                "--model",
-                os.getenv("MODEL", ""),
-                task
-            ],
+            command,
             cwd=workdir,
             capture_output=True,
             text=True,
@@ -134,15 +163,16 @@ def run_agent(repo: str = Form(...), task: str = Form(...)):
 
         output = result.stdout + "\n" + result.stderr
 
-        return HTMLResponse(
-            HTML.format(
-                result=f"<h3>Agent Output</h3><pre>{output}</pre>"
-            )
+        return page(
+            f"<h3>Agent Output</h3><pre>{escape(output)}</pre>"
+        )
+
+    except subprocess.TimeoutExpired:
+        return page(
+            "<pre>⏱️ Agent timed out.</pre>"
         )
 
     except Exception as e:
-        return HTMLResponse(
-            HTML.format(
-                result=f"<h3>❌ Error</h3><pre>{e}</pre>"
-            )
+        return page(
+            f"<pre>❌ {escape(str(e))}</pre>"
         )
