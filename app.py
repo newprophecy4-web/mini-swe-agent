@@ -3,13 +3,12 @@ import time
 import random
 import shutil
 import tempfile
-import zipfile
+import subprocess
 from pathlib import Path
-from typing import Optional
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from google import genai
 
 
@@ -18,9 +17,7 @@ from google import genai
 # =========================================================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if not GEMINI_API_KEY:
-    print("WARNING: GEMINI_API_KEY is not configured")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
 MODEL_NAME = os.getenv(
     "GEMINI_MODEL",
@@ -28,15 +25,6 @@ MODEL_NAME = os.getenv(
 )
 
 MAX_RETRIES = 3
-
-BASE_DIR = Path(__file__).resolve().parent
-DOWNLOAD_DIR = BASE_DIR / "downloads"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-
-# =========================================================
-# GEMINI CLIENT
-# =========================================================
 
 client = None
 
@@ -47,18 +35,13 @@ if GEMINI_API_KEY:
 
 
 # =========================================================
-# FASTAPI APP
+# APP
 # =========================================================
 
 app = FastAPI(
     title="Open Agent API",
-    version="1.0.0"
+    version="2.0.0"
 )
-
-
-# =========================================================
-# CORS
-# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,35 +53,24 @@ app.add_middleware(
 
 
 # =========================================================
-# GEMINI RETRY SYSTEM
+# GEMINI
 # =========================================================
 
-def is_retryable_error(error: Exception) -> bool:
-    error_text = str(error).lower()
+def is_retryable_error(error):
+    text = str(error).lower()
 
-    retryable_keywords = [
+    return any(x in text for x in [
         "503",
         "429",
         "unavailable",
         "high demand",
         "resource exhausted",
-        "temporarily unavailable",
         "service unavailable",
-    ]
-
-    return any(
-        keyword in error_text
-        for keyword in retryable_keywords
-    )
+    ])
 
 
-def generate_with_retry(prompt: str) -> str:
-    """
-    Generate Gemini response with retry support
-    for temporary errors such as 503 and 429.
-    """
-
-    if client is None:
+def generate_with_retry(prompt):
+    if not client:
         raise RuntimeError(
             "GEMINI_API_KEY is not configured"
         )
@@ -106,7 +78,6 @@ def generate_with_retry(prompt: str) -> str:
     last_error = None
 
     for attempt in range(MAX_RETRIES):
-
         try:
             response = client.models.generate_content(
                 model=MODEL_NAME,
@@ -118,43 +89,274 @@ def generate_with_retry(prompt: str) -> str:
             if text and text.strip():
                 return text.strip()
 
-            raise RuntimeError(
-                "The AI model returned an empty response"
-            )
+            raise RuntimeError("Empty AI response")
 
         except Exception as error:
-
             last_error = error
-
-            print(
-                f"Gemini error "
-                f"(attempt {attempt + 1}/{MAX_RETRIES}): "
-                f"{error}"
-            )
 
             if not is_retryable_error(error):
                 raise
 
             if attempt < MAX_RETRIES - 1:
-
-                # Exponential backoff
-                # Attempt 1 -> ~2 seconds
-                # Attempt 2 -> ~4 seconds
                 delay = (
                     2 ** (attempt + 1)
                     + random.uniform(0, 1)
                 )
 
-                print(
-                    f"Retrying in {delay:.1f} seconds..."
-                )
-
                 time.sleep(delay)
 
     raise RuntimeError(
-        "The AI model is temporarily busy. "
-        "Please try again in a moment."
+        "AI model is temporarily busy. "
+        "Please try again later."
     ) from last_error
+
+
+# =========================================================
+# GITHUB URL
+# =========================================================
+
+def validate_github_url(repo_url):
+    parsed = urlparse(repo_url)
+
+    if parsed.netloc not in [
+        "github.com",
+        "www.github.com"
+    ]:
+        raise HTTPException(
+            status_code=400,
+            detail="Only GitHub repositories are supported"
+        )
+
+    path = parsed.path.strip("/")
+
+    if path.endswith(".git"):
+        path = path[:-4]
+
+    parts = path.split("/")
+
+    if len(parts) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid GitHub repository URL"
+        )
+
+    owner = parts[0]
+    repo = parts[1]
+
+    return owner, repo
+
+
+def authenticated_repo_url(repo_url):
+    owner, repo = validate_github_url(repo_url)
+
+    if GITHUB_TOKEN:
+        return (
+            f"https://x-access-token:"
+            f"{GITHUB_TOKEN}"
+            f"@github.com/{owner}/{repo}.git"
+        )
+
+    return (
+        f"https://github.com/"
+        f"{owner}/{repo}.git"
+    )
+
+
+# =========================================================
+# GIT COMMAND
+# =========================================================
+
+def run_command(command, cwd=None):
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr or result.stdout
+            )
+
+        return result.stdout.strip()
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "Command timed out"
+        )
+
+
+# =========================================================
+# CLONE REPOSITORY
+# =========================================================
+
+def clone_repository(repo_url):
+    workspace = Path(
+        tempfile.mkdtemp(
+            prefix="open_agent_repo_"
+        )
+    )
+
+    repo_dir = workspace / "repository"
+
+    clone_url = authenticated_repo_url(
+        repo_url
+    )
+
+    try:
+        run_command([
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            clone_url,
+            str(repo_dir)
+        ])
+
+        return workspace, repo_dir
+
+    except Exception:
+        shutil.rmtree(
+            workspace,
+            ignore_errors=True
+        )
+        raise
+
+
+# =========================================================
+# SAFE PATH
+# =========================================================
+
+def safe_file_path(repo_dir, relative_path):
+    relative_path = relative_path.lstrip("/")
+
+    target = (
+        repo_dir /
+        relative_path
+    ).resolve()
+
+    repo_root = repo_dir.resolve()
+
+    if target != repo_root and \
+       repo_root not in target.parents:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file path"
+        )
+
+    return target
+
+
+# =========================================================
+# FILE TREE
+# =========================================================
+
+def get_file_tree(repo_dir):
+    files = []
+
+    ignored = {
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+    }
+
+    for path in repo_dir.rglob("*"):
+
+        if any(
+            part in ignored
+            for part in path.parts
+        ):
+            continue
+
+        if path.is_file():
+
+            relative = path.relative_to(
+                repo_dir
+            )
+
+            files.append(
+                str(relative)
+            )
+
+    return sorted(files)
+
+
+# =========================================================
+# PROJECT CONTEXT
+# =========================================================
+
+def build_project_context(
+    repo_dir,
+    max_files=30,
+    max_chars_per_file=6000
+):
+    tree = get_file_tree(repo_dir)
+
+    important_extensions = [
+        ".py",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".html",
+        ".css",
+        ".json",
+        ".md",
+        ".yaml",
+        ".yml",
+    ]
+
+    selected = []
+
+    for relative in tree:
+        if len(selected) >= max_files:
+            break
+
+        path = repo_dir / relative
+
+        if path.suffix.lower() in \
+           important_extensions:
+
+            selected.append(relative)
+
+    context = []
+
+    context.append(
+        "PROJECT FILE TREE:\n" +
+        "\n".join(tree[:300])
+    )
+
+    for relative in selected:
+
+        path = repo_dir / relative
+
+        try:
+            content = path.read_text(
+                encoding="utf-8",
+                errors="ignore"
+            )
+
+            content = content[
+                :max_chars_per_file
+            ]
+
+            context.append(
+                f"\n\nFILE: {relative}\n"
+                f"```\n{content}\n```"
+            )
+
+        except Exception:
+            continue
+
+    return "\n".join(context)
 
 
 # =========================================================
@@ -165,42 +367,40 @@ def generate_with_retry(prompt: str) -> str:
 def root():
     return {
         "name": "Open Agent API",
-        "status": "online",
-        "model": MODEL_NAME
+        "status": "online"
     }
 
 
 @app.get("/health")
 def health():
-
     return {
         "status": "ok",
         "model": MODEL_NAME,
-        "gemini_configured": bool(GEMINI_API_KEY),
+        "gemini_configured": bool(
+            GEMINI_API_KEY
+        ),
+        "github_configured": bool(
+            GITHUB_TOKEN
+        ),
         "capabilities": {
             "chat": True,
-            "plan_mode": True,
-            "work_mode": True,
-            "zip": True,
-            "github": True,
-            "streaming": False
+            "github_read": True,
+            "github_edit": True,
+            "github_commit": True,
+            "github_push": True
         }
     }
 
 
 # =========================================================
-# NORMAL CHAT
+# CHAT
 # =========================================================
 
 @app.post("/chat")
 def chat(
     message: str = Form(...),
-    conversation_context: Optional[str] = Form(None)
+    conversation_context: str = Form("")
 ):
-    """
-    Normal ChatGPT-like conversation endpoint.
-    """
-
     if not message.strip():
         raise HTTPException(
             status_code=400,
@@ -208,28 +408,25 @@ def chat(
         )
 
     prompt = f"""
-You are Open Agent, a helpful AI assistant and
-software engineering assistant.
+You are Open Agent.
 
-You can communicate naturally in the user's language.
+Reply naturally and helpfully.
 
-Reply in the same language used by the user whenever
-possible.
+Use the same language as the user when possible.
 
-Current conversation context:
+Conversation context:
 
-{conversation_context or "No previous context."}
+{conversation_context}
 
 User message:
 
 {message}
-
-Answer naturally and helpfully.
 """
 
     try:
-
-        answer = generate_with_retry(prompt)
+        answer = generate_with_retry(
+            prompt
+        )
 
         return {
             "ok": True,
@@ -237,449 +434,54 @@ Answer naturally and helpfully.
         }
 
     except Exception as error:
-
-        error_text = str(error)
-
-        if is_retryable_error(error) or \
-           "temporarily busy" in error_text.lower():
-
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "The AI model is temporarily busy. "
-                    "Please try again in a moment."
-                )
-            )
-
         raise HTTPException(
-            status_code=500,
-            detail=error_text
+            status_code=503
+            if is_retryable_error(error)
+            else 500,
+            detail=str(error)
         )
 
 
 # =========================================================
-# PLAN MODE
+# INSPECT REPOSITORY
 # =========================================================
 
-@app.post("/plan")
-def create_plan(
-    task: str = Form(...),
-    conversation_context: Optional[str] = Form(None),
-    repo_url: Optional[str] = Form(None),
-    project_zip: Optional[UploadFile] = File(None)
+@app.post("/repository/inspect")
+def inspect_repository(
+    repo_url: str = Form(...)
 ):
-    """
-    Creates a planning response.
-    This endpoint does not intentionally modify files.
-    """
-
-    if not task.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Task cannot be empty"
-        )
-
-    project_info = ""
-
-    if repo_url:
-        project_info += (
-            f"\nGitHub repository:\n{repo_url}\n"
-        )
-
-    if project_zip:
-        project_info += (
-            f"\nProject ZIP provided:\n"
-            f"{project_zip.filename}\n"
-        )
-
-    prompt = f"""
-You are Open Agent.
-
-You are currently in PLAN MODE.
-
-Important rules:
-
-- Discuss naturally with the user.
-- Do not claim to have modified files.
-- Do not claim to have executed commands.
-- Analyze requirements carefully.
-- Ask questions when clarification is useful.
-- Respect previous conversation decisions.
-- Use the user's language.
-
-Conversation context:
-
-{conversation_context or "No previous conversation."}
-
-Project information:
-
-{project_info or "No project source provided."}
-
-Current user request:
-
-{task}
-
-Provide a helpful planning response.
-"""
-
-    try:
-
-        answer = generate_with_retry(prompt)
-
-        return {
-            "ok": True,
-            "mode": "plan",
-            "result": {
-                "status": "completed",
-                "steps": 1,
-                "logs": [],
-                "final": answer
-            }
-        }
-
-    except Exception as error:
-
-        error_text = str(error)
-
-        if is_retryable_error(error):
-
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "The AI model is temporarily busy. "
-                    "Please try again shortly."
-                )
-            )
-
-        raise HTTPException(
-            status_code=500,
-            detail=error_text
-        )
-
-
-# =========================================================
-# MAIN /run ENDPOINT
-# =========================================================
-
-@app.post("/run")
-async def run_agent(
-    task: str = Form(...),
-    mode: str = Form("work"),
-    repo_url: Optional[str] = Form(None),
-    approved_plan: Optional[str] = Form(None),
-    conversation_context: Optional[str] = Form(None),
-    project_zip: Optional[UploadFile] = File(None)
-):
-    """
-    Main compatibility endpoint.
-
-    Supports:
-    - task
-    - mode
-    - repo_url
-    - project_zip
-    - approved_plan
-    - conversation_context
-    """
-
-    if not task.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Task cannot be empty"
-        )
-
-    mode = mode.lower().strip()
-
-    if mode not in ["plan", "work", "chat"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid mode"
-        )
-
-    # -----------------------------------------------------
-    # CHAT MODE
-    # -----------------------------------------------------
-
-    if mode == "chat":
-
-        prompt = f"""
-You are Open Agent, a conversational AI assistant.
-
-Conversation context:
-
-{conversation_context or "None"}
-
-User:
-
-{task}
-
-Reply naturally in the user's language.
-"""
-
-        try:
-
-            answer = generate_with_retry(prompt)
-
-            return {
-                "ok": True,
-                "mode": "chat",
-                "result": {
-                    "status": "completed",
-                    "steps": 1,
-                    "logs": [],
-                    "final": answer
-                }
-            }
-
-        except Exception as error:
-
-            raise HTTPException(
-                status_code=503
-                if is_retryable_error(error)
-                else 500,
-                detail=(
-                    "The AI model is temporarily busy. "
-                    "Please try again."
-                    if is_retryable_error(error)
-                    else str(error)
-                )
-            )
-
-    # -----------------------------------------------------
-    # PLAN MODE
-    # -----------------------------------------------------
-
-    if mode == "plan":
-
-        prompt = f"""
-You are Open Agent in PLAN MODE.
-
-Do not pretend that you modified files.
-
-Analyze the user's request and conversation.
-
-Conversation:
-
-{conversation_context or "None"}
-
-Repository:
-
-{repo_url or "None"}
-
-Task:
-
-{task}
-
-Provide a detailed but practical implementation plan.
-"""
-
-        try:
-
-            answer = generate_with_retry(prompt)
-
-            return {
-                "ok": True,
-                "mode": "plan",
-                "result": {
-                    "status": "completed",
-                    "steps": 1,
-                    "logs": [],
-                    "final": answer
-                }
-            }
-
-        except Exception as error:
-
-            raise HTTPException(
-                status_code=503
-                if is_retryable_error(error)
-                else 500,
-                detail=(
-                    "The AI model is temporarily busy. "
-                    "Please try again."
-                    if is_retryable_error(error)
-                    else str(error)
-                )
-            )
-
-    # -----------------------------------------------------
-    # WORK MODE
-    # -----------------------------------------------------
-
     workspace = None
 
     try:
+        workspace, repo_dir = \
+            clone_repository(repo_url)
 
-        workspace = Path(
-            tempfile.mkdtemp(
-                prefix="open_agent_"
-            )
+        owner, repo = validate_github_url(
+            repo_url
         )
 
-        logs = []
-
-        logs.append(
-            "Agent workspace prepared"
-        )
-
-        # -------------------------------------------------
-        # ZIP PROJECT
-        # -------------------------------------------------
-
-        if project_zip:
-
-            if not project_zip.filename.lower().endswith(
-                ".zip"
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Project must be a ZIP file"
-                )
-
-            zip_path = workspace / "project.zip"
-
-            with open(zip_path, "wb") as file:
-
-                shutil.copyfileobj(
-                    project_zip.file,
-                    file
-                )
-
-            logs.append(
-                f"Project ZIP received: "
-                f"{project_zip.filename}"
-            )
-
-            try:
-
-                with zipfile.ZipFile(
-                    zip_path,
-                    "r"
-                ) as archive:
-
-                    archive.extractall(
-                        workspace / "project"
-                    )
-
-                logs.append(
-                    "Project ZIP extracted"
-                )
-
-            except zipfile.BadZipFile:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid ZIP file"
-                )
-
-        # -------------------------------------------------
-        # REPOSITORY
-        # -------------------------------------------------
-
-        if repo_url:
-
-            logs.append(
-                f"Repository requested: {repo_url}"
-            )
-
-        # -------------------------------------------------
-        # AGENT PROMPT
-        # -------------------------------------------------
-
-        prompt = f"""
-You are Open Agent in WORK MODE.
-
-The user has explicitly allowed the agent to work.
-
-Your task:
-
-{task}
-
-Approved plan:
-
-{approved_plan or "No separate approved plan was provided."}
-
-Conversation context:
-
-{conversation_context or "No conversation context provided."}
-
-Repository:
-
-{repo_url or "No repository provided."}
-
-Important:
-
-Be honest about what you actually did.
-
-Do not claim to have modified files unless a real file
-operation was performed by the backend.
-
-Do not claim tests passed unless they were actually run.
-
-Provide a useful final report.
-
-Reply in the user's language where possible.
-"""
-
-        logs.append(
-            "Requesting AI analysis"
-        )
-
-        answer = generate_with_retry(prompt)
-
-        logs.append(
-            "AI response completed"
-        )
-
-        # -------------------------------------------------
-        # CURRENT VERSION NOTE
-        # -------------------------------------------------
-
-        logs.append(
-            "Work response completed"
-        )
+        tree = get_file_tree(repo_dir)
 
         return {
             "ok": True,
-            "mode": "work",
-            "result": {
-                "status": "completed",
-                "steps": len(logs),
-                "logs": logs,
-                "final": answer
+            "accessible": True,
+            "repository": {
+                "owner": owner,
+                "name": repo
             },
-            "download_url": None
+            "file_count": len(tree),
+            "files": tree[:500]
         }
 
-    except HTTPException:
-        raise
-
     except Exception as error:
-
-        print(f"Agent error: {error}")
-
-        status_code = (
-            503
-            if is_retryable_error(error)
-            else 500
-        )
-
-        raise HTTPException(
-            status_code=status_code,
-            detail=(
-                "The AI model is temporarily busy. "
-                "Please try again in a moment."
-                if status_code == 503
-                else str(error)
-            )
-        )
+        return {
+            "ok": False,
+            "accessible": False,
+            "error": str(error)
+        }
 
     finally:
-
-        # Workspace cleanup.
-        # Keep this disabled if you later need to package
-        # modified project files into a ZIP.
-        if workspace and workspace.exists():
+        if workspace:
             shutil.rmtree(
                 workspace,
                 ignore_errors=True
@@ -687,45 +489,221 @@ Reply in the user's language where possible.
 
 
 # =========================================================
-# DOWNLOAD
+# READ FILE
 # =========================================================
 
-@app.get("/download/{filename}")
-def download_file(filename: str):
+@app.post("/repository/read")
+def read_repository_file(
+    repo_url: str = Form(...),
+    file_path: str = Form(...)
+):
+    workspace = None
 
-    safe_filename = Path(filename).name
+    try:
+        workspace, repo_dir = \
+            clone_repository(repo_url)
 
-    file_path = (
-        DOWNLOAD_DIR /
-        safe_filename
-    )
-
-    if not file_path.exists():
-
-        raise HTTPException(
-            status_code=404,
-            detail="File not found"
+        target = safe_file_path(
+            repo_dir,
+            file_path
         )
 
-    return FileResponse(
-        path=file_path,
-        filename=safe_filename,
-        media_type="application/zip"
-    )
+        if not target.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="File not found"
+            )
+
+        if not target.is_file():
+            raise HTTPException(
+                status_code=400,
+                detail="Not a file"
+            )
+
+        content = target.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+        return {
+            "ok": True,
+            "path": file_path,
+            "content": content
+        }
+
+    finally:
+        if workspace:
+            shutil.rmtree(
+                workspace,
+                ignore_errors=True
+            )
 
 
 # =========================================================
-# STARTUP
+# EDIT FILE + COMMIT + PUSH
 # =========================================================
 
-@app.on_event("startup")
-async def startup_event():
-
-    print("=================================")
-    print("Open Agent API started")
-    print(f"Model: {MODEL_NAME}")
-    print(
-        f"Gemini configured: "
-        f"{bool(GEMINI_API_KEY)}"
+@app.post("/repository/edit")
+def edit_repository_file(
+    repo_url: str = Form(...),
+    file_path: str = Form(...),
+    content: str = Form(...),
+    commit_message: str = Form(
+        "Update file via Open Agent"
     )
-    print("=================================")
+):
+    workspace = None
+
+    try:
+        workspace, repo_dir = \
+            clone_repository(repo_url)
+
+        target = safe_file_path(
+            repo_dir,
+            file_path
+        )
+
+        target.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        target.write_text(
+            content,
+            encoding="utf-8"
+        )
+
+        run_command([
+            "git",
+            "config",
+            "user.name",
+            "Open Agent"
+        ], cwd=repo_dir)
+
+        run_command([
+            "git",
+            "config",
+            "user.email",
+            "open-agent@localhost"
+        ], cwd=repo_dir)
+
+        run_command([
+            "git",
+            "add",
+            file_path
+        ], cwd=repo_dir)
+
+        run_command([
+            "git",
+            "commit",
+            "-m",
+            commit_message
+        ], cwd=repo_dir)
+
+        commit_hash = run_command([
+            "git",
+            "rev-parse",
+            "HEAD"
+        ], cwd=repo_dir)
+
+        run_command([
+            "git",
+            "push",
+            "origin",
+            "HEAD"
+        ], cwd=repo_dir)
+
+        return {
+            "ok": True,
+            "message": "File updated and pushed",
+            "file": file_path,
+            "commit": commit_hash
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
+
+    finally:
+        if workspace:
+            shutil.rmtree(
+                workspace,
+                ignore_errors=True
+            )
+
+
+# =========================================================
+# WORK MODE
+# =========================================================
+
+@app.post("/work")
+def work(
+    repo_url: str = Form(...),
+    task: str = Form(...),
+    approved_plan: str = Form("")
+):
+    workspace = None
+
+    try:
+        workspace, repo_dir = \
+            clone_repository(repo_url)
+
+        project_context = \
+            build_project_context(
+                repo_dir
+            )
+
+        prompt = f"""
+You are Open Agent in WORK MODE.
+
+You have successfully accessed the target
+GitHub repository.
+
+User task:
+
+{task}
+
+Approved plan:
+
+{approved_plan}
+
+Repository context:
+
+{project_context}
+
+Analyze the project and explain precisely:
+
+1. Which files should change.
+2. What changes are needed.
+3. Any risks or conflicts.
+4. A concrete implementation approach.
+
+Do not claim that files were changed unless
+the backend actually performed an edit operation.
+"""
+
+        answer = generate_with_retry(
+            prompt
+        )
+
+        return {
+            "ok": True,
+            "mode": "work",
+            "repository_access": True,
+            "analysis": answer
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
+
+    finally:
+        if workspace:
+            shutil.rmtree(
+                workspace,
+                ignore_errors=True
+            )
