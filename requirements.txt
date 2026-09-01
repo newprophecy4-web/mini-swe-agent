@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-python-multipart
-requests
-beautifulsoup4
 google-genai
+pydantic
+python-multipart
+httpx
