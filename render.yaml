@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: open-agent
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: MAX_UPLOAD_MB
+        value: "50"
+      - key: MAX_COMMAND_SECONDS
+        value: "20"
+      - key: MAX_AGENT_STEPS
+        value: "12"
