@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -74,6 +75,7 @@ from google.genai import types
 
 APP_NAME = "Open Agent"
 APP_VERSION = "2.0.0"
+LOGGER = logging.getLogger(APP_NAME)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv(
@@ -793,11 +795,28 @@ class GeminiService:
 
                 last_error = exc
 
+                LOGGER.warning(
+                    "Gemini request failed: attempt=%s model=%s "
+                    "error_type=%s error=%s",
+                    attempt + 1,
+                    GEMINI_MODEL,
+                    type(exc).__name__,
+                    str(exc)[:500],
+                )
+
                 # Temporary Gemini/service failures.
                 if attempt < 3:
                     await asyncio.sleep(
-                        1.5 * (attempt + 1)
+                        2 ** (attempt + 1)
                     )
+
+        LOGGER.error(
+            "Gemini request exhausted retries: model=%s "
+            "error_type=%s error=%s",
+            GEMINI_MODEL,
+            type(last_error).__name__ if last_error else "unknown",
+            str(last_error)[:500] if last_error else "unknown",
+        )
 
         raise HTTPException(
             status_code=503,
