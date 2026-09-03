@@ -16,6 +16,11 @@ services:
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
 
+      # Protects existing native-Python Render services that have not yet
+      # been switched to the Docker runtime defined above.
+      - key: PYTHON_VERSION
+        value: "3.12.3"
+
       - key: MAX_AGENT_ITERATIONS
         value: "20"
 
