@@ -3572,6 +3572,12 @@ async def health():
             "available": ai_service.available(),
             "model": chat_plan_router.providers[0].chat_model,
         },
+        "work": {
+            "provider": "mini-SWE-agent",
+            "configured": ai_router.available(),
+            "available": ai_router.available(),
+            "model": ai_router.providers[0].model,
+        },
 
         "github": {
             "configured": bool(
