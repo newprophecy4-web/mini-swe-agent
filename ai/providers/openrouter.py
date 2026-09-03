@@ -92,6 +92,8 @@ class OpenRouterProvider:
             "temperature": temperature,
             "stream": False,
         }
+        if system and "Return ONLY valid JSON" in system:
+            payload["response_format"] = {"type": "json_object"}
         last_failure: Optional[ProviderFailure] = None
 
         for key in self._ordered_keys():
