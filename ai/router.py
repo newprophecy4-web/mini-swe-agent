@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 from ai.base import AIProvider, ProviderFailure
+from ai.providers.gemini import GeminiProvider
 from ai.providers.openrouter import OpenRouterProvider
 
 
@@ -35,4 +36,6 @@ class AIRouter:
         raise ProviderFailure("No configured AI provider is available.")
 
 
-ai_router = AIRouter()
+work_router = AIRouter([OpenRouterProvider()])
+chat_plan_router = AIRouter([GeminiProvider()])
+ai_router = work_router

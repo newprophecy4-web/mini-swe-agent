@@ -66,7 +66,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from ai.base import ProviderFailure
-from ai.router import ai_router
+from ai.router import ai_router, chat_plan_router
 
 
 # ============================================================
@@ -721,8 +721,11 @@ def log_event(
 
 class AIService:
 
+    def __init__(self, router=chat_plan_router) -> None:
+        self.router = router
+
     def available(self) -> bool:
-        return ai_router.available()
+        return self.router.available()
 
     async def text(
         self,
@@ -731,7 +734,7 @@ class AIService:
         temperature: float = 0.2,
     ) -> str:
         try:
-            return await ai_router.generate(
+            return await self.router.generate(
                 prompt,
                 system,
                 temperature,
@@ -747,7 +750,8 @@ class AIService:
             ) from exc
 
 
-ai_service = AIService()
+ai_service = AIService(chat_plan_router)
+work_ai_service = AIService(ai_router)
 
 
 # ============================================================
@@ -2212,7 +2216,7 @@ def autonomous_worker(
             try:
 
                 response = asyncio.run(
-                    ai_service.text(
+                    work_ai_service.text(
                         prompt,
                         system=AGENT_SYSTEM_PROMPT,
                         temperature=0.15,
@@ -3538,10 +3542,10 @@ async def health():
         "status": "online",
 
         "ai": {
-            "provider": "OpenRouter",
+            "provider": "Gemini",
             "configured": ai_service.available(),
             "available": ai_service.available(),
-            "model": ai_router.providers[0].model,
+            "model": chat_plan_router.providers[0].chat_model,
         },
 
         "github": {
@@ -3583,7 +3587,15 @@ async def health():
 @app.get("/ai/providers")
 async def ai_providers():
     return {
-        "providers": ai_router.status(),
+        "providers": chat_plan_router.status() + [
+            {
+                "name": "mini-SWE-agent",
+                "purpose": ["work", "coding"],
+                "configured": ai_router.available(),
+                "available": ai_router.available(),
+                "model": ai_router.providers[0].model,
+            }
+        ],
     }
 
 

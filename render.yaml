@@ -7,6 +7,13 @@ services:
     healthCheckPath: /health
 
     envVars:
+      - key: GEMINI_API_KEY
+        sync: true
+      - key: GEMINI_CHAT_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_PLAN_MODEL
+        value: gemini-2.5-flash
+
       - key: OPENROUTER_API_KEY_1
         sync: true
       - key: OPENROUTER_API_KEY_2
@@ -17,6 +24,7 @@ services:
       - key: GITHUB_TOKEN
         sync: true
 
+      # Coding model used only by the Work Mode mini-SWE-agent engine.
       - key: OPENROUTER_MODEL
         value: openrouter/free
 
