@@ -8,7 +8,7 @@ Architecture:
        v
     FastAPI
        |
-       +---- Gemini AI
+       +---- AI Provider Router
        |
        +---- GitHub
        |
@@ -65,8 +65,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from google import genai
-from google.genai import types
+from ai.base import ProviderFailure
+from ai.router import ai_router
 
 
 # ============================================================
@@ -76,12 +76,6 @@ from google.genai import types
 APP_NAME = "Open Agent"
 APP_VERSION = "2.0.0"
 LOGGER = logging.getLogger(APP_NAME)
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-2.5-flash",
-).strip()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 
@@ -722,22 +716,13 @@ def log_event(
 
 
 # ============================================================
-# GEMINI
+# PROVIDER-INDEPENDENT AI SERVICE
 # ============================================================
 
-class GeminiService:
-
-    def __init__(self) -> None:
-
-        self.client: Optional[genai.Client] = None
-
-        if GEMINI_API_KEY:
-            self.client = genai.Client(
-                api_key=GEMINI_API_KEY
-            )
+class AIService:
 
     def available(self) -> bool:
-        return self.client is not None
+        return ai_router.available()
 
     async def text(
         self,
@@ -745,86 +730,24 @@ class GeminiService:
         system: Optional[str] = None,
         temperature: float = 0.2,
     ) -> str:
-
-        if not self.client:
+        try:
+            return await ai_router.generate(
+                prompt,
+                system,
+                temperature,
+            )
+        except ProviderFailure as exc:
+            LOGGER.warning(
+                "AI provider request failed: %s",
+                str(exc)[:800],
+            )
             raise HTTPException(
                 status_code=503,
-                detail="GEMINI_API_KEY is not configured.",
-            )
-
-        full_prompt = prompt
-
-        if system:
-            full_prompt = (
-                system
-                + "\n\n"
-                + prompt
-            )
-
-        last_error: Optional[Exception] = None
-
-        for attempt in range(4):
-
-            try:
-
-                def call_model():
-                    return self.client.models.generate_content(
-                        model=GEMINI_MODEL,
-                        contents=full_prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=temperature,
-                        ),
-                    )
-
-                response = await asyncio.to_thread(
-                    call_model
-                )
-
-                text = getattr(
-                    response,
-                    "text",
-                    None,
-                )
-
-                if text:
-                    return text.strip()
-
-                return ""
-
-            except Exception as exc:
-
-                last_error = exc
-
-                LOGGER.warning(
-                    "Gemini request failed: attempt=%s model=%s "
-                    "error_type=%s error=%s",
-                    attempt + 1,
-                    GEMINI_MODEL,
-                    type(exc).__name__,
-                    str(exc)[:500],
-                )
-
-                # Temporary Gemini/service failures.
-                if attempt < 3:
-                    await asyncio.sleep(
-                        2 ** (attempt + 1)
-                    )
-
-        LOGGER.error(
-            "Gemini request exhausted retries: model=%s "
-            "error_type=%s error=%s",
-            GEMINI_MODEL,
-            type(last_error).__name__ if last_error else "unknown",
-            str(last_error)[:500] if last_error else "unknown",
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail="AI service is temporarily unavailable. Please try again later.",
-        )
+                detail="AI provider is currently unavailable. Please try again later.",
+            ) from exc
 
 
-gemini_service = GeminiService()
+ai_service = AIService()
 
 
 # ============================================================
@@ -929,7 +852,9 @@ def safe_environment() -> Dict[str, str]:
 
     secret_names = {
         "GITHUB_TOKEN",
-        "GEMINI_API_KEY",
+        "OPENROUTER_API_KEY_1",
+        "OPENROUTER_API_KEY_2",
+        "OPENROUTER_API_KEY_3",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "GOOGLE_API_KEY",
@@ -2044,7 +1969,7 @@ def execute_agent_action(
 
         forbidden_patterns = [
             "github_token",
-            "gemini_api_key",
+            "openrouter_api_key",
             "openai_api_key",
             "printenv",
             "env",
@@ -2287,7 +2212,7 @@ def autonomous_worker(
             try:
 
                 response = asyncio.run(
-                    gemini_service.text(
+                    ai_service.text(
                         prompt,
                         system=AGENT_SYSTEM_PROMPT,
                         temperature=0.15,
@@ -2582,7 +2507,7 @@ performed the operation.
 Do not claim tests passed unless actual test output confirms it.
 """
 
-    return await gemini_service.text(
+    return await ai_service.text(
         prompt,
         system=AGENT_SYSTEM_PROMPT,
         temperature=0.35,
@@ -2732,7 +2657,7 @@ Do NOT modify files.
 Return a clear human-readable plan.
 """
 
-    plan = await gemini_service.text(
+    plan = await ai_service.text(
         prompt,
         system=AGENT_SYSTEM_PROMPT,
         temperature=0.25,
@@ -3613,11 +3538,10 @@ async def health():
         "status": "online",
 
         "ai": {
-            "provider": "Google Gemini",
-            "configured": bool(
-                GEMINI_API_KEY
-            ),
-            "model": GEMINI_MODEL,
+            "provider": "OpenRouter",
+            "configured": ai_service.available(),
+            "available": ai_service.available(),
+            "model": ai_router.providers[0].model,
         },
 
         "github": {
@@ -3653,6 +3577,13 @@ async def health():
             "plan": True,
             "work": True,
         },
+    }
+
+
+@app.get("/ai/providers")
+async def ai_providers():
+    return {
+        "providers": ai_router.status(),
     }
 
 
