@@ -933,6 +933,7 @@ def run_process(
     command: List[str],
     cwd: Path,
     timeout: int = COMMAND_TIMEOUT,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
 
     if not cwd.exists():
@@ -944,10 +945,14 @@ def run_process(
 
     try:
 
+        environment = safe_environment()
+        if extra_env:
+            environment.update(extra_env)
+
         process = subprocess.run(
             command,
             cwd=str(cwd),
-            env=safe_environment(),
+            env=environment,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1025,7 +1030,7 @@ def parse_github(
     return owner, repo
 
 
-def github_auth_header() -> str:
+def github_auth_config() -> str:
 
     if not GITHUB_TOKEN:
         raise HTTPException(
@@ -1034,9 +1039,23 @@ def github_auth_header() -> str:
         )
 
     return (
-        "http.extraheader="
-        f"AUTHORIZATION: bearer {GITHUB_TOKEN}"
+        "credential.helper=!f() { "
+        "echo username=x-access-token; "
+        "echo password=$GITHUB_TOKEN; "
+        "}; f"
     )
+
+
+def github_auth_environment() -> Dict[str, str]:
+    if not GITHUB_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="GITHUB_TOKEN is not configured.",
+        )
+    return {
+        "GITHUB_TOKEN": GITHUB_TOKEN,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
 
 
 def clone_repo(
@@ -1067,7 +1086,7 @@ def clone_repo(
     command = [
         "git",
         "-c",
-        github_auth_header(),
+        github_auth_config(),
         "clone",
     ]
 
@@ -1086,6 +1105,7 @@ def clone_repo(
         command,
         WORKSPACE_ROOT,
         timeout=WORKSPACE_TIMEOUT,
+        extra_env=github_auth_environment(),
     )
 
     if not result["ok"]:
@@ -1239,13 +1259,14 @@ def git_push(
         [
             "git",
             "-c",
-            github_auth_header(),
+            github_auth_config(),
             "push",
             "origin",
             target,
         ],
         workspace,
         timeout=WORKSPACE_TIMEOUT,
+        extra_env=github_auth_environment(),
     )
 
 
