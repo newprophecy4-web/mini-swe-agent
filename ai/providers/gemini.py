@@ -37,7 +37,11 @@ class GeminiProvider:
         if not self.api_key:
             raise ProviderFailure("No Gemini API key is configured.")
 
-        model = self.plan_model if system and "Plan Mode" in system else self.chat_model
+        model = (
+            self.plan_model
+            if "Create a professional software implementation plan." in prompt
+            else self.chat_model
+        )
         contents = [{"role": "user", "parts": [{"text": prompt}]}]
         payload = {
             "contents": contents,
