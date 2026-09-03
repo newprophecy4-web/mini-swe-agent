@@ -19,7 +19,12 @@ class OpenRouterProvider:
     name = "OpenRouter"
 
     def __init__(self) -> None:
-        self.model = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
+        configured_model = os.getenv("OPENROUTER_MODEL", "").strip()
+        self.model = (
+            "qwen/qwen3-coder:free"
+            if not configured_model or configured_model == "openrouter/free"
+            else configured_model
+        )
         self._keys = tuple(
             value.strip()
             for name in (
