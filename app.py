@@ -798,6 +798,31 @@ def extract_json(
         except Exception:
             pass
 
+    # Common OpenRouter tool-call markup emitted by some coding models.
+    tool_match = re.search(
+        r"<tool_call>\s*([a-zA-Z_]+).*?"
+        r"<arg_key>(path|query)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if tool_match:
+        return {
+            "action": tool_match.group(1),
+            tool_match.group(2): tool_match.group(3).strip(),
+        }
+
+    invoke_match = re.search(
+        r'<invoke\s+name=["\']([a-zA-Z_]+)["\']>.*?'
+        r'<parameter\s+name=["\'](path|query)["\']>(.*?)</parameter>',
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if invoke_match:
+        return {
+            "action": invoke_match.group(1),
+            invoke_match.group(2): invoke_match.group(3).strip(),
+        }
+
     return None
 
 
