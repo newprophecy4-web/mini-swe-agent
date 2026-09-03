@@ -29,7 +29,19 @@ services:
         value: "180"
 
       - key: AUTO_PUSH
-        value: "true"
+        value: "false"
 
       - key: FRONTEND_ORIGINS
-        value: "*"
+        sync: true
+
+      - key: MAX_UPLOAD_SIZE
+        value: "52428800"
+
+      - key: MAX_ZIP_FILES
+        value: "10000"
+
+      - key: MAX_ZIP_UNCOMPRESSED_SIZE
+        value: "524288000"
+
+      - key: SESSION_TTL
+        value: "3600"

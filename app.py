@@ -38,6 +38,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -108,6 +109,16 @@ WORKSPACE_TIMEOUT = int(
 MAX_FILE_SIZE = int(
     os.getenv("MAX_FILE_SIZE", str(2 * 1024 * 1024))
 )
+
+MAX_UPLOAD_SIZE = int(
+    os.getenv("MAX_UPLOAD_SIZE", str(50 * 1024 * 1024))
+)
+
+MAX_ZIP_FILES = int(os.getenv("MAX_ZIP_FILES", "10000"))
+MAX_ZIP_UNCOMPRESSED_SIZE = int(
+    os.getenv("MAX_ZIP_UNCOMPRESSED_SIZE", str(500 * 1024 * 1024))
+)
+SESSION_TTL = int(os.getenv("SESSION_TTL", str(60 * 60)))
 
 MAX_SEARCH_RESULTS = int(
     os.getenv("MAX_SEARCH_RESULTS", "100")
@@ -611,6 +622,7 @@ class AgentSession:
 
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
+    last_accessed_at: float = field(default_factory=time.time)
 
     lock: threading.RLock = field(
         default_factory=threading.RLock,
@@ -651,7 +663,32 @@ def get_session(
             detail="Session not found",
         )
 
+    now = time.time()
+    with session.lock:
+        last_accessed = session.last_accessed_at
+        if session.finished_at and now - last_accessed > SESSION_TTL:
+            raise HTTPException(status_code=404, detail="Session expired")
+        session.last_accessed_at = now
+
     return session
+
+
+def cleanup_expired_sessions() -> None:
+    """Remove completed sessions and their workspaces after the retention window."""
+    cutoff = time.time() - SESSION_TTL
+    expired: List[AgentSession] = []
+    with SESSIONS_LOCK:
+        for session_id, session in list(SESSIONS.items()):
+            with session.lock:
+                if session.finished_at and session.last_accessed_at < cutoff:
+                    expired.append(session)
+                    del SESSIONS[session_id]
+
+    for session in expired:
+        if session.workspace:
+            shutil.rmtree(session.workspace.parent, ignore_errors=True)
+        (UPLOAD_ROOT / f"{session.id}.zip").unlink(missing_ok=True)
+        (EXPORT_ROOT / f"{session.id}.zip").unlink(missing_ok=True)
 
 
 # ============================================================
@@ -764,10 +801,7 @@ class GeminiService:
 
         raise HTTPException(
             status_code=503,
-            detail=(
-                "AI service is temporarily unavailable. "
-                f"Reason: {last_error}"
-            ),
+            detail="AI service is temporarily unavailable. Please try again later.",
         )
 
 
@@ -2949,12 +2983,12 @@ async def project_upload(
         / f"{session.id}.zip"
     )
 
-    data = await file.read()
+    data = await file.read(MAX_UPLOAD_SIZE + 1)
 
-    if len(data) > 100 * 1024 * 1024:
+    if len(data) > MAX_UPLOAD_SIZE:
         raise HTTPException(
             status_code=413,
-            detail="ZIP file is too large.",
+            detail=f"ZIP file exceeds the {MAX_UPLOAD_SIZE} byte limit.",
         )
 
     zip_path.write_bytes(data)
@@ -2966,7 +3000,20 @@ async def project_upload(
             "r",
         ) as archive:
 
-            for member in archive.infolist():
+            members = archive.infolist()
+            if len(members) > MAX_ZIP_FILES:
+                raise HTTPException(status_code=413, detail="ZIP contains too many files.")
+
+            total_uncompressed = 0
+            for member in members:
+
+                total_uncompressed += member.file_size
+                if total_uncompressed > MAX_ZIP_UNCOMPRESSED_SIZE:
+                    raise HTTPException(status_code=413, detail="ZIP expands beyond the allowed size.")
+
+                mode = (member.external_attr >> 16) & 0xFFFF
+                if stat.S_ISLNK(mode):
+                    raise HTTPException(status_code=400, detail="Symbolic links are not allowed in ZIP files.")
 
                 member_path = (
                     destination
@@ -2985,9 +3032,13 @@ async def project_upload(
                         ),
                     )
 
-            archive.extractall(
-                destination
-            )
+                if member.is_dir():
+                    member_path.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                member_path.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member, "r") as source, member_path.open("wb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
 
     except zipfile.BadZipFile:
 
@@ -3513,6 +3564,8 @@ async def download_file(
 @app.get("/health")
 async def health():
 
+    cleanup_expired_sessions()
+
     return {
         "ok": True,
         "service": APP_NAME,
@@ -3549,6 +3602,10 @@ async def health():
                 WORKSPACE_TIMEOUT
             ),
             "max_file_size": MAX_FILE_SIZE,
+            "max_upload_size": MAX_UPLOAD_SIZE,
+            "max_zip_files": MAX_ZIP_FILES,
+            "max_zip_uncompressed_size": MAX_ZIP_UNCOMPRESSED_SIZE,
+            "session_ttl": SESSION_TTL,
         },
 
         "modes": {
@@ -3600,7 +3657,6 @@ async def global_exception_handler(
         content={
             "ok": False,
             "error": "Internal server error.",
-            "detail": str(exc),
         },
     )
 
