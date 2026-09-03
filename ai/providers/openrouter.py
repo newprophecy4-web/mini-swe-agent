@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -92,7 +93,11 @@ class OpenRouterProvider:
             "temperature": temperature,
             "stream": False,
         }
-        if system and "Return ONLY valid JSON" in system:
+        if (
+            system
+            and "Return ONLY valid JSON" in system
+            and self.model != "openrouter/free"
+        ):
             payload["response_format"] = {"type": "json_object"}
         last_failure: Optional[ProviderFailure] = None
 
@@ -131,8 +136,25 @@ class OpenRouterProvider:
 
                 data = response.json()
                 choices = data.get("choices") or []
-                content = choices[0].get("message", {}).get("content") if choices else None
-                if not isinstance(content, str):
+                message = choices[0].get("message", {}) if choices else {}
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = "".join(
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict)
+                    )
+                if not isinstance(content, str) or not content.strip():
+                    tool_calls = message.get("tool_calls") or []
+                    if tool_calls:
+                        function = tool_calls[0].get("function", {})
+                        content = json.dumps(
+                            {
+                                "action": function.get("name", ""),
+                                **self._parse_arguments(function.get("arguments")),
+                            }
+                        )
+                if not isinstance(content, str) or not content.strip():
                     raise ProviderFailure("OpenRouter returned a malformed response.")
                 LOGGER.info("[AI] OpenRouter request completed")
                 return content.strip()
@@ -146,3 +168,15 @@ class OpenRouterProvider:
                 raise
 
         raise last_failure or ProviderFailure("OpenRouter is unavailable.")
+
+    @staticmethod
+    def _parse_arguments(arguments: object) -> dict:
+        if isinstance(arguments, dict):
+            return arguments
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+                return parsed if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
+                return {}
+        return {}
