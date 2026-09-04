@@ -106,7 +106,7 @@ def run_official_agent(
         model = OpenRouterModel(
             model_name=model_name,
             cost_tracking="ignore_errors",
-            model_kwargs={"temperature": 0.15},
+            model_kwargs={"temperature": 0.15, "max_tokens": 2000},
         )
         agent = DefaultAgent(
             model=model,
