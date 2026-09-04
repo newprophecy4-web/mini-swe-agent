@@ -18,6 +18,9 @@ from minisweagent.exceptions import Submitted
 from minisweagent.models.openrouter_model import OpenRouterModel
 
 
+DEFAULT_WORK_MODEL = "anthropic/claude-3.5-sonnet"
+LEGACY_FREE_MODEL = "openrouter/free"
+
 SYSTEM_TEMPLATE = """You are Open Agent Work Mode running the official mini-SWE-agent engine.
 You have one tool: bash. Use it to inspect and modify the active repository.
 Work directly in the supplied working directory. Read files before editing, make the requested changes across all necessary files, run tests and builds, diagnose failures, fix them, and retest.
@@ -77,8 +80,10 @@ def run_official_agent(
 ) -> dict[str, Any]:
     if not api_key:
         raise RuntimeError("No OpenRouter API key is configured for Work Mode.")
-    if not model_name or model_name == "openrouter/free":
-        raise RuntimeError("OPENROUTER_MODEL must name a configured coding model; openrouter/free is not allowed.")
+    if not model_name or model_name == LEGACY_FREE_MODEL:
+        if model_name == LEGACY_FREE_MODEL:
+            on_event("model_fallback", f"Ignoring legacy {LEGACY_FREE_MODEL}; using {DEFAULT_WORK_MODEL}.", {"configured_model": model_name, "model": DEFAULT_WORK_MODEL})
+        model_name = DEFAULT_WORK_MODEL
 
     # The official model reads OPENROUTER_API_KEY. This assignment is process-local;
     # the key is never placed in the frontend, trajectory, or command environment.

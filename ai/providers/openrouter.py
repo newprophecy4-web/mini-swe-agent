@@ -14,13 +14,20 @@ from ai.base import ProviderFailure
 
 LOGGER = logging.getLogger("Open Agent")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_WORK_MODEL = "anthropic/claude-3.5-sonnet"
+LEGACY_FREE_MODEL = "openrouter/free"
 
 
 class OpenRouterProvider:
     name = "OpenRouter"
 
     def __init__(self) -> None:
-        self.model = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet").strip()
+        configured_model = os.getenv("OPENROUTER_MODEL", "").strip()
+        if not configured_model or configured_model == LEGACY_FREE_MODEL:
+            if configured_model == LEGACY_FREE_MODEL:
+                LOGGER.warning("Ignoring legacy OPENROUTER_MODEL=openrouter/free; using %s.", DEFAULT_WORK_MODEL)
+            configured_model = DEFAULT_WORK_MODEL
+        self.model = configured_model
         self._keys = tuple(
             value.strip()
             for name in (
