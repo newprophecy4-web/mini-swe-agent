@@ -18,7 +18,7 @@ from minisweagent.exceptions import Submitted
 from minisweagent.models.openrouter_model import OpenRouterModel
 
 
-DEFAULT_WORK_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_WORK_MODEL = "cohere/north-mini-code:free"
 LEGACY_FREE_MODEL = "openrouter/free"
 
 SYSTEM_TEMPLATE = """You are Open Agent Work Mode running the official mini-SWE-agent engine.

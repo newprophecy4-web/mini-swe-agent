@@ -14,7 +14,7 @@ from ai.base import ProviderFailure
 
 LOGGER = logging.getLogger("Open Agent")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_WORK_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_WORK_MODEL = "cohere/north-mini-code:free"
 LEGACY_FREE_MODEL = "openrouter/free"
 
 
