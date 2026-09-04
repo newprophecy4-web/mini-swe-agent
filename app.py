@@ -67,6 +67,7 @@ from pydantic import BaseModel, Field
 
 from ai.base import ProviderFailure
 from ai.router import ai_router, chat_plan_router
+from ai.miniswe_engine import run_official_agent
 
 
 # ============================================================
@@ -153,7 +154,7 @@ app = FastAPI(
     title="Open Agent API",
     description=(
         "Advanced autonomous AI software engineering agent "
-        "with Chat, Plan and authorized Work modes."
+        "with Plan and authorized Work modes."
     ),
     version=APP_VERSION,
 )
@@ -531,6 +532,11 @@ class PlanRequest(BaseModel):
     context: Optional[str] = None
 
 
+class RevisePlanRequest(BaseModel):
+    session_id: str
+    message: str = Field(min_length=1)
+
+
 class FinalizePlanRequest(BaseModel):
     session_id: str
     plan: Optional[str] = None
@@ -746,7 +752,11 @@ class AIService:
             )
             raise HTTPException(
                 status_code=503,
-                detail="AI provider is currently unavailable. Please try again later.",
+                detail={
+                    "message": str(exc) or "AI provider is currently unavailable.",
+                    "provider_status": exc.status_code,
+                    "retry_after": exc.retry_after,
+                },
             ) from exc
 
 
@@ -2169,341 +2179,46 @@ RULES:
 # AUTONOMOUS WORK LOOP
 # ============================================================
 
-def autonomous_worker(
-    session: AgentSession,
-    task: str,
-) -> None:
-
+def autonomous_worker(session: AgentSession, task: str) -> None:
     session.started_at = time.time()
     session.status = "working"
     session.cancelled = False
     session.task = task
 
-    log_event(
-        session,
-        "work_started",
-        "Open Agent started autonomous work.",
-    )
+    def on_event(event: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
+        log_event(session, event, message, data)
 
-    history: List[Dict[str, Any]] = []
-
-    started = time.time()
-
+    log_event(session, "work_started", "Open Agent started the official mini-SWE-agent engine.")
     try:
-
-        while (
-            session.iterations
-            < MAX_AGENT_ITERATIONS
-        ):
-
-            if session.cancelled:
-                session.status = "stopped"
-
-                log_event(
-                    session,
-                    "work_stopped",
-                    "Work stopped by user.",
-                )
-
-                return
-
-            if (
-                time.time() - started
-                > WORKSPACE_TIMEOUT
-            ):
-                session.status = "failed"
-
-                log_event(
-                    session,
-                    "timeout",
-                    "Maximum work session timeout reached.",
-                )
-
-                return
-
-            session.iterations += 1
-
-            log_event(
-                session,
-                "agent_iteration",
-                f"Agent iteration {session.iterations}",
-                {
-                    "iteration": session.iterations,
-                },
-            )
-
-            prompt = agent_action_prompt(
-                session,
-                task,
-                history,
-            )
-
-            try:
-
-                response = asyncio.run(
-                    work_ai_service.text(
-                        prompt,
-                        system=AGENT_SYSTEM_PROMPT,
-                        temperature=0.15,
-                    )
-                )
-
-            except Exception as exc:
-
-                log_event(
-                    session,
-                    "ai_error",
-                    str(exc),
-                )
-
-                session.status = "failed"
-                return
-
-            action = extract_json(response)
-
-            if not isinstance(action, dict):
-
-                log_event(
-                    session,
-                    "invalid_action",
-                    "AI returned invalid action JSON.",
-                    {
-                        "response": response[:5000],
-                    },
-                )
-
-                history.append(
-                    {
-                        "type": "error",
-                        "error": (
-                            "Invalid JSON action "
-                            "returned by AI."
-                        ),
-                    }
-                )
-
-                continue
-
-            action_name = action.get(
-                "action",
-                "unknown",
-            )
-
-            log_event(
-                session,
-                "agent_action",
-                f"Executing {action_name}",
-                {
-                    "action": action_name,
-                },
-            )
-
-            result = execute_agent_action(
-                session,
-                action,
-            )
-
-            # Never expose potentially sensitive
-            # command arguments or environment data.
-            safe_result = dict(result)
-
-            history.append(
-                {
-                    "action": action,
-                    "result": safe_result,
-                }
-            )
-
-            log_event(
-                session,
-                "action_result",
-                f"{action_name} completed.",
-                {
-                    "ok": result.get("ok"),
-                    "operation": result.get(
-                        "operation"
-                    ),
-                    "returncode": result.get(
-                        "returncode"
-                    ),
-                    "stdout": result.get(
-                        "stdout",
-                        "",
-                    )[-10000:],
-                    "stderr": result.get(
-                        "stderr",
-                        "",
-                    )[-10000:],
-                },
-            )
-
-            # ------------------------------------------------
-            # TEST FAILURE
-            # ------------------------------------------------
-
-            if (
-                action_name in {
-                    "run_test",
-                    "run_build",
-                    "run_typecheck",
-                    "run_command",
-                }
-                and result.get("ok") is False
-            ):
-
-                if (
-                    session.test_iterations
-                    >= MAX_TEST_ITERATIONS
-                ):
-
-                    log_event(
-                        session,
-                        "test_limit",
-                        (
-                            "Maximum test/fix "
-                            "iterations reached."
-                        ),
-                    )
-
-                    # Let AI make final assessment.
-                    history.append(
-                        {
-                            "type": "test_limit",
-                            "message": (
-                                "Maximum test iterations "
-                                "reached."
-                            ),
-                        }
-                    )
-
-                else:
-
-                    log_event(
-                        session,
-                        "error_detected",
-                        (
-                            "Failure detected. "
-                            "Agent should diagnose and fix."
-                        ),
-                        {
-                            "stderr": result.get(
-                                "stderr",
-                                "",
-                            )[-10000:],
-                        },
-                    )
-
-            # ------------------------------------------------
-            # FINISH
-            # ------------------------------------------------
-
-            if (
-                action_name == "finish"
-                and result.get("finished")
-            ):
-
-                log_event(
-                    session,
-                    "final_review",
-                    "Running final git status and diff.",
-                )
-
-                final_status = git_status(
-                    session.workspace
-                )
-
-                final_diff = git_diff(
-                    session.workspace
-                )
-
-                log_event(
-                    session,
-                    "final_state",
-                    "Final workspace state collected.",
-                    {
-                        "git_status": final_status,
-                        "git_diff": final_diff,
-                    },
-                )
-
-                session.status = "completed"
-                session.finished_at = time.time()
-
-                log_event(
-                    session,
-                    "work_completed",
-                    result.get(
-                        "summary",
-                        "Work completed.",
-                    ),
-                )
-
-                # Optional automatic push.
-                if AUTO_PUSH and GITHUB_TOKEN:
-
-                    log_event(
-                        session,
-                        "auto_push",
-                        "AUTO_PUSH is enabled. Pushing changes.",
-                    )
-
-                    push_result = git_push(
-                        session.workspace
-                    )
-
-                    log_event(
-                        session,
-                        "push_result",
-                        (
-                            "Automatic push completed."
-                            if push_result.get("ok")
-                            else "Automatic push failed."
-                        ),
-                        {
-                            "ok": push_result.get(
-                                "ok"
-                            ),
-                            "stderr": push_result.get(
-                                "stderr",
-                                "",
-                            )[-10000:],
-                            "stdout": push_result.get(
-                                "stdout",
-                                "",
-                            )[-10000:],
-                        },
-                    )
-
-                return
-
-        session.status = "failed"
-
-        log_event(
-            session,
-            "iteration_limit",
-            (
-                "Maximum autonomous agent "
-                "iterations reached."
-            ),
+        if not session.workspace:
+            raise RuntimeError("Work session has no workspace.")
+        model = os.getenv("OPENROUTER_MODEL", "").strip()
+        if model == "openrouter/free":
+            raise RuntimeError("OPENROUTER_MODEL must be configured to a named coding model; openrouter/free is not supported.")
+        keys = [os.getenv(name, "").strip() for name in ("OPENROUTER_API_KEY", "OPENROUTER_API_KEY_1", "OPENROUTER_API_KEY_2", "OPENROUTER_API_KEY_3")]
+        api_key = next((key for key in keys if key), "")
+        result = run_official_agent(
+            workspace=session.workspace,
+            task=task,
+            model_name=model,
+            api_key=api_key,
+            timeout=WORKSPACE_TIMEOUT,
+            step_limit=MAX_AGENT_ITERATIONS,
+            on_event=on_event,
         )
-
+        final_status = git_status(session.workspace)
+        final_diff = git_diff(session.workspace)
+        log_event(session, "final_state", "Final workspace state collected.", {"git_status": final_status, "git_diff": final_diff})
+        if result.get("exit_status") in {"Submitted", "", None} or result.get("submission") is not None:
+            session.status = "completed"
+            log_event(session, "work_completed", "Work completed by the official mini-SWE-agent engine.", {"result": result})
+        else:
+            session.status = "failed"
+            log_event(session, "work_failed", "The official mini-SWE-agent exited without a successful submission.", {"result": result})
     except Exception as exc:
-
         session.status = "failed"
-
-        log_event(
-            session,
-            "worker_exception",
-            str(exc),
-            {
-                "traceback": traceback.format_exc()[
-                    -10000:
-                ]
-            },
-        )
-
+        log_event(session, "work_failed", str(exc), {"traceback": traceback.format_exc()[-10000:]})
     finally:
-
         session.finished_at = time.time()
 
 
@@ -2709,6 +2424,28 @@ Return a clear human-readable plan.
         "plan": plan,
         "finalized": False,
     }
+
+
+@app.post("/plan/revise")
+async def revise_plan(request: RevisePlanRequest):
+    session = get_session(request.session_id)
+    if session.mode != "plan":
+        raise HTTPException(status_code=400, detail="Only Plan Mode sessions can be revised.")
+    context = session.plan or "No previous plan exists."
+    prompt = f"""Revise the following software implementation plan based on the user's requested changes.
+
+CURRENT PLAN:
+{context}
+
+USER REVISION:
+{request.message}
+
+Return the complete revised human-readable plan. Do not modify files."""
+    session.plan = await ai_service.text(prompt, system=AGENT_SYSTEM_PROMPT, temperature=0.25)
+    session.task = request.message
+    session.status = "planned"
+    log_event(session, "plan_revised", "Implementation plan revised.")
+    return {"ok": True, "session_id": session.id, "mode": "plan", "plan": session.plan, "finalized": False}
 
 
 # ============================================================
@@ -3608,7 +3345,6 @@ async def health():
         },
 
         "modes": {
-            "chat": True,
             "plan": True,
             "work": True,
         },
@@ -3648,7 +3384,6 @@ async def root():
         "openapi": "/openapi.json",
         "health": "/health",
         "modes": [
-            "chat",
             "plan",
             "work",
         ],

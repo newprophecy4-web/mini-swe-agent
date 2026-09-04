@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
+# Install the repository package so the official mini-SWE-agent bindings are importable by app.py.
+RUN pip install --no-cache-dir --no-deps .
+
 RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app
 

@@ -20,10 +20,11 @@ class OpenRouterProvider:
     name = "OpenRouter"
 
     def __init__(self) -> None:
-        self.model = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
+        self.model = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet").strip()
         self._keys = tuple(
             value.strip()
             for name in (
+                "OPENROUTER_API_KEY",
                 "OPENROUTER_API_KEY_1",
                 "OPENROUTER_API_KEY_2",
                 "OPENROUTER_API_KEY_3",
@@ -96,7 +97,7 @@ class OpenRouterProvider:
         if (
             system
             and "Return ONLY valid JSON" in system
-            and self.model != "openrouter/free"
+            and self.model
         ):
             payload["response_format"] = {"type": "json_object"}
         last_failure: Optional[ProviderFailure] = None

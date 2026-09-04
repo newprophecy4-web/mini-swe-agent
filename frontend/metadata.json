@@ -1,0 +1,6 @@
+{
+  "name": "Open Agent Studio",
+  "description": "Production-ready workspace and frontend client for Open Agent autonomous AI software engineering backend",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
