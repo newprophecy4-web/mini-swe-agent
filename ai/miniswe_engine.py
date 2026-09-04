@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable
+
+# Render may run this service with its native Python runtime instead of the
+# Dockerfile. Make the repository-bundled official engine importable in both
+# deployment modes without copying or reimplementing mini-SWE-agent.
+_REPOSITORY_SRC = Path(__file__).resolve().parents[1] / "src"
+if _REPOSITORY_SRC.is_dir() and str(_REPOSITORY_SRC) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_SRC))
 
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments.local import LocalEnvironment, _run
